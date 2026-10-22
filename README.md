@@ -3,7 +3,9 @@
 **Un allocateur GPU déterministe pour modèles d'IA locaux : un seul modèle à la fois sur la carte, une file d'attente propre, et un service qui ne ment jamais sur ce qui tourne vraiment.**
 
 [![Licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
-[![CI](https://github.com/OWNERTEST/turnstile/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNERTEST/turnstile/actions/workflows/ci.yml)
+[![CI](https://github.com/bengua/turnstile/actions/workflows/ci.yml/badge.svg)](https://github.com/bengua/turnstile/actions/workflows/ci.yml)
+
+**Tutoriel** : [installation pas à pas sur freedzhost.cloud](https://freedzhost.cloud/fr/turnstile.html) · [step-by-step tutorial on freedzhost.cloud (EN)](https://freedzhost.cloud/en/turnstile.html)
 
 > English version below: [English](#english).
 
@@ -40,7 +42,7 @@ Ce n'est pas un serveur de modèles : `llama.cpp` (ou un autre moteur) sert les 
 ### Installer
 
 ```bash
-git clone https://github.com/OWNERTEST/turnstile
+git clone https://github.com/bengua/turnstile
 cd turnstile
 ./install.sh
 ```
@@ -157,7 +159,7 @@ Et c'est une brique de plus pour faire tourner ses modèles chez soi, sur son ma
 Requirements: Linux with systemd user sessions, Docker, Python 3.10+, and one existing container per slot, named like the slot. An NVIDIA card is tested daily; AMD and Intel are untested; with no card, only CPU slots are managed.
 
 ```bash
-git clone https://github.com/OWNERTEST/turnstile
+git clone https://github.com/bengua/turnstile
 cd turnstile
 ./install.sh                                  # user-level, no root
 $EDITOR ~/.config/turnstile/containers.map    # name|port|card|weights|arguments
