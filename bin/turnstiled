@@ -1,0 +1,1398 @@
+#!/usr/bin/env python3
+"""turnstiled — the probe and the allocator behind the model grid.
+
+WHAT IT DOES, in the order the design was settled:
+
+  1. PROBE — the foundation, not the swapping
+     Confronts the declared slot with FOUR observed facts:
+       - the container is running
+       - its port answers
+       - the card's memory usage is consistent
+       - THE MODEL ANSWERING IS THE ONE EXPECTED   <- read from the server log
+     The fourth is the one that was missing. Two of my presets served a 3B
+     while believing they served a 27B, for days, and the port answered the
+     whole time.
+
+  2. THE IN-BETWEEN IS A STATE OF ITS OWN
+     During a load, the state is neither the old one nor the new one. The
+     inference server's log gives four timestamped stages; reading the
+     weights is 93 % of the wall clock, so the remainder is estimated from
+     the file size.
+
+  3. TRAFFIC CONTROL
+     A request arriving during a load is QUEUED. A load in progress is never
+     cancelled. A container started by hand is RESPECTED and reported as
+     such, never overwritten.
+
+  4. COUNTERS FROM DAY ONE
+     Saying a system exists is worth nothing. A system that counts its own
+     service is worth something immediately, and thirty days of counters
+     answer questions no opinion can. The counters are not a feature to add
+     later; they are the reason the first version shipped.
+
+No dependencies: standard library only.
+"""
+import hmac
+import http.server
+import json
+import os
+import re
+import socket
+import socketserver
+import statistics
+import subprocess
+import sys
+import threading
+import time
+
+
+def _first_existing(*paths):
+    for p in paths:
+        p = os.path.expanduser(p)
+        if os.path.exists(p):
+            return p
+    return os.path.expanduser(paths[0])
+
+
+MAP = os.environ.get("TURNSTILE_MAP") or _first_existing(
+    "~/.config/turnstile/containers.map", "/etc/turnstile/containers.map")
+# Guests: containers that may use a card whenever no slot holds it (the
+# house's voice on card 0, 03/10/2026). One line per guest: `container|card`.
+GUESTS = os.path.expanduser(os.environ.get("TURNSTILE_GUESTS", "~/.config/turnstile/guests.map"))
+STANDINS = os.path.expanduser(os.environ.get("TURNSTILE_STANDINS", "~/.config/turnstile/standins.map"))
+STATE_FILE = os.path.expanduser(
+    os.environ.get("TURNSTILE_STATE", "~/.local/state/turnstile/state.json"))
+# The judgment corpus: one line per decision, append only, never rewritten.
+# `turnstile-cascade` reads it to compute agreement between a remote judge
+# and a local one, and it is the training set for any future specialisation.
+CORPUS = os.path.expanduser(
+    os.environ.get("TURNSTILE_CORPUS", "~/.local/state/turnstile/pairs.jsonl"))
+PORT = int(os.environ.get("TURNSTILE_PORT", "8130"))
+BIND = os.environ.get("TURNSTILE_BIND", "0.0.0.0")
+# Optional shared secret. Unset, the API is open — which is fine on a
+# loopback bind and careless on a LAN one. Set it and every request must
+# carry `Authorization: Bearer <token>`.
+TOKEN = os.environ.get("TURNSTILE_TOKEN", "")
+# Optional second secret that only READS: the GET routes accept it, the POST
+# routes refuse it. Most callers only ever ask /state — a job dropper, a mail
+# worker, a status page — yet with one token each of them could also empty a
+# card. Give them this one; keep TURNSTILE_TOKEN for what swaps. Ignored when
+# TURNSTILE_TOKEN is unset (the API is open then anyway).
+READ_TOKEN = os.environ.get("TURNSTILE_READ_TOKEN", "")
+# Containers that are neither slots nor worth reporting as started by hand:
+# a gateway, a proxy, anything living beside the grid without holding a card.
+IGNORE = set(filter(None, os.environ.get("TURNSTILE_IGNORE", "").split(",")))
+
+# Thresholds. Every one of these came from a measurement, not a preference.
+FAIL_AFTER = 30           # seconds: twice the worst load measured here (15 s)
+WORST_S_PER_GB = 2.0      # a big model gets this long per GB before its load is called failed: Flash-Next
+                          # (116 GB, weights streamed from the SSD) listens after ~134 s, and the flat 30 s
+                          # declared it failed while it was still loading (05/10/2026)
+
+
+def load_deadline(size):
+    """Seconds a load may take before it is called failed: the flat floor, or 2 s per GB if larger."""
+    return max(FAIL_AFTER, size * WORST_S_PER_GB)
+# The version THIS file carries. It exists for a precise reason: on
+# 29/09/2026, on this fleet, a tool ran for two hours in a version installed
+# by hand while the repository carried another one — and nothing, anywhere,
+# could say so. A service that cannot announce its version does not let you
+# know whether the machine runs what the repository describes.
+VERSION = "0.2.0"
+
+CARD_FLOOR = 1000         # MiB: below this, the card is carrying nothing
+PROBE_PERIOD = 10         # seconds between two probe passes
+
+# ── the rate ceiling ────────────────────────────────────────────────────
+#
+# Six alternating requests produced SIX loads in 32 seconds, with no
+# resistance whatsoever. The allocator obeys — that is its job — and the
+# settle delay lives in the watcher. But nothing protected against a client
+# in a loop: a misconfigured stream, a script in error, a forgotten test.
+#
+# A machine that flaps endlessly is WORSE than a machine that is down: a
+# clean outage is noticed and repaired, an oscillation burns power, wears
+# the cards and goes unnoticed.
+#
+# The ceiling is generous — normal use never reaches it — and it refuses
+# CHANGE requests only: a slot already serving keeps serving.
+MAX_SWAPS_PER_HOUR = 30
+
+# Load time estimation.
+#
+# Measured here: 8.4 GB on one card in 2.2 s (0.26 s/GB), 9.1 GB in 3.7 s
+# (0.41), 16 GB across TWO cards in 12.3 s (0.77), 75 GB across two cards
+# with memory mapping in 15 s (0.20).
+#
+# This is NOT linear in size: the 75 GB model is the fastest per gigabyte of
+# anything here. The variables that matter are the NUMBER OF CARDS
+# (splitting is expensive) and the LOADING MODE (memory mapping does not
+# read everything). Hence a table per profile, not a single constant.
+#
+# These values are SEEDS. Every real swap adds a measurement point and the
+# estimate corrects itself — see learn_duration().
+SEEDS = {                        # (card_count, mmap) -> seconds per GB
+    (1, False): 0.33,
+    (1, True): 0.20,
+    (2, False): 0.77,
+    (2, True): 0.20,
+}
+BASE_SECONDS = 1.0
+MIN_POINTS = 5                   # below this, keep the seed
+
+
+def sh(cmd, timeout=20):
+    try:
+        return subprocess.run(cmd, shell=True, capture_output=True,
+                              text=True, timeout=timeout,
+                              check=False).stdout
+    except subprocess.TimeoutExpired:
+        return ""
+
+
+# ── the hardware layer ──────────────────────────────────────────────────
+#
+# Everything used to go through `nvidia-smi`. On an AMD machine the card
+# table stayed empty and the service saw nothing: a tool that knows one
+# vendor only serves the people who bought that vendor.
+#
+# Three differences to absorb, and not one more:
+#   1. AMD has no `--query-gpu`: combine `--show*` calls with `--json`
+#   2. AMD reports memory in BYTES, NVIDIA in mebibytes
+#   3. the confinement variable is HIP_VISIBLE_DEVICES on AMD
+#
+# The AMD and Intel paths are written from the vendor documentation and have
+# NOT been exercised on real hardware — I own neither. Treat them as a
+# starting point, not as a guarantee.
+
+def _gpu_tool():
+    for name, probe in (("nvidia", "nvidia-smi -L"),
+                        ("amd", "amd-smi list"),
+                        ("amd-rocm", "rocm-smi --showid"),
+                        ("intel", "xpu-smi discovery -j")):
+        try:
+            r = subprocess.run(probe, shell=True, capture_output=True,
+                               text=True, timeout=10, check=False)
+            if r.returncode == 0 and r.stdout.strip():
+                return name
+        except Exception:
+            continue
+    return "none"
+
+
+TOOL = _gpu_tool()
+VISIBILITY_VAR = {"nvidia": "CUDA_VISIBLE_DEVICES",
+                  "amd": "HIP_VISIBLE_DEVICES",
+                  "amd-rocm": "HIP_VISIBLE_DEVICES",
+                  "intel": "ZE_AFFINITY_MASK"}.get(TOOL, "CUDA_VISIBLE_DEVICES")
+
+
+def _memory_amd():
+    """Used memory per card, in mebibytes. ROCm reports bytes."""
+    for cmd in ("amd-smi metric --mem-usage --json",
+                "rocm-smi --showmeminfo vram --json"):
+        out = sh(cmd)
+        if not out.strip():
+            continue
+        try:
+            d = json.loads(out)
+        except ValueError:
+            continue
+        values = []
+        for card in (d if isinstance(d, list) else d.values()):
+            if not isinstance(card, dict):
+                continue
+            for k, v in card.items():
+                if "used" in k.lower() and "vram" in k.lower():
+                    try:
+                        values.append(int(str(v).split()[0]) >> 20)
+                    except (ValueError, IndexError):
+                        pass
+                    break
+        if values:
+            return values
+    return []
+
+
+def _discover_cards():
+    """Map each card's UUID prefix to its driver index.
+
+    These values used to be hardcoded — two UUIDs from one specific machine.
+    A tool that carries its author's hardware only serves its author. The
+    table is discovered at startup: with no GPU it stays empty and anything
+    that is not `cpu` is simply unknown."""
+    table = {}
+    if TOOL == "nvidia":
+        out = sh("nvidia-smi --query-gpu=index,uuid --format=csv,noheader")
+        for l in out.splitlines():
+            p = [x.strip() for x in l.split(",")]
+            if len(p) == 2 and p[1].startswith("GPU-"):
+                table[p[1][4:12]] = p[0]
+    elif TOOL.startswith("amd"):
+        out = sh("amd-smi list --json") or sh("rocm-smi --showid --json")
+        try:
+            d = json.loads(out)
+            cards = d if isinstance(d, list) else list(d.values())
+            for i, c in enumerate(cards):
+                uid = str((c or {}).get("uuid") or (c or {}).get("Unique ID") or i)
+                table[uid[:8]] = str(i)
+        except Exception:
+            for i in range(len(_memory_amd())):
+                table[f"amd{i:04d}"] = str(i)
+    elif TOOL == "intel":
+        try:
+            d = json.loads(sh("xpu-smi discovery -j"))
+            for i, c in enumerate(d.get("device_list") or []):
+                table[str(c.get("uuid", i))[:8]] = str(c.get("device_id", i))
+        except Exception:
+            pass
+    return table
+
+
+CARD_INDEX = _discover_cards()
+
+
+# ── the RELEASE slots ───────────────────────────────────────────────────
+#
+# A release slot loads no model: it HANDS BACK a footprint. Asking for
+# `free-all` unloads every card and declares them available for something
+# else — an image and video studio (ComfyUI, Wan, Flux, LTX), a game, a
+# render.
+#
+# Same grammar as for a model: asking for a slot means getting the resource.
+# Here the resource is emptiness, and that is what lets an external program
+# take a card WITHOUT stealing it: it asks, the turnstile frees, the state
+# says so.
+#
+# Without these slots, an external program quietly starts on a card the
+# turnstile believes is its own, and the two fight until the first
+# out-of-memory.
+def _release_slots():
+    """One release slot per card, plus one for all of them if several."""
+    s = {f"free-c{i}": {"footprint": str(i),
+                        "purpose": f"card {i} alone, handed to an external program"}
+         for i in sorted(CARD_INDEX.values())}
+    if len(CARD_INDEX) > 1:
+        s["free-all"] = {"footprint": "all",
+                         "purpose": "every card, for a large render"}
+    return s
+
+
+RELEASE_SLOTS = _release_slots()
+
+
+# ────────────────────────────────────────────────────────────── the map
+
+def read_map():
+    """name|port|card|weights|arguments — the only source of slots."""
+    slots = {}
+    try:
+        with open(MAP) as f:
+            lines = f.read().splitlines()
+    except OSError as e:
+        print(f"map unreadable: {e}", file=sys.stderr)
+        return slots
+    for l in lines:
+        l = l.strip()
+        if not l or l.startswith("#"):
+            continue
+        p = l.split("|")
+        if len(p) < 5:
+            continue
+        name, port, card, weights, args = p[0], p[1], p[2], p[3], p[4]
+        m = re.search(r"-m\s+(\S+)", args)
+        c = re.search(r"-c\s+(\d+)", args)
+        g = re.search(r"--size-gb\s+([0-9.]+)", args)       # engines with no -m file: the weights' size, for the load deadline
+        slots[name] = {
+            "port": int(port) if port.isdigit() else None,
+            "card": card,
+            "weights": weights,
+            "model": m.group(1) if m else None,
+            "context_requested": int(c.group(1)) if c else None,
+            "size_gb": float(g.group(1)) if g else None,
+        }
+    return slots
+
+
+def read_guests():
+    """container|card — a guest uses a card only while no slot holds it.
+
+    A guest is not a slot: it is never declared, never measured, never
+    restored. It yields: the turnstile stops it before a slot loads on its card
+    and when the card is released to an external program (a game), and starts
+    it again once the card holds nothing."""
+    guests = {}
+    try:
+        with open(GUESTS) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "|" in line:
+                    name, card = (x.strip() for x in line.split("|")[:2])
+                    if name and card not in ("", "cpu", "all"):
+                        guests[name] = card
+    except OSError:
+        pass
+    return guests
+
+
+def read_guest_shares():
+    """container -> the slots it may stay beside: `container|card|slot,slot` (third field optional).
+
+    A guest that fits beside a small model need not yield to it: the house's voice and the light
+    coder share card 0 (16 GB: 6.8 + 7.2 + their buffers). Any other slot, a release to a game, or
+    a slot spanning every card still stops it. Named one by one, never by pattern: a share is a
+    measured fact about two containers, not a rule about a family."""
+    shares = {}
+    try:
+        with open(GUESTS) as f:
+            for line in f:
+                parts = [x.strip() for x in line.strip().split("|")]
+                if len(parts) >= 3 and parts[0] and not parts[0].startswith("#"):
+                    shares[parts[0]] = {x.strip() for x in parts[2].split(",") if x.strip()}
+    except OSError:
+        pass
+    return shares
+
+
+def read_standins():
+    """release|slot — a slot that stands in on ANOTHER card while a release holds its own.
+
+    The 5080 serves the big model; a game takes it. Without a stand-in the house keeps only
+    what lives on the other card. With `free-c0|<27B on card 1>`, the release starts the 27B
+    on card 1 (its guests yield to it, as to any slot), and leaving the release stops it again,
+    so card 1's guests come back. The stand-in is never declared: the declared slot stays the
+    release, and `restore` still goes back to what served before the game (05/10/2026)."""
+    out = {}
+    try:
+        with open(STANDINS) as f:
+            for line in f:
+                parts = [x.strip() for x in line.strip().split("|")]
+                if len(parts) >= 2 and parts[0] and parts[1] and not parts[0].startswith("#"):
+                    out[parts[0]] = parts[1]
+    except OSError:
+        pass
+    return out
+
+
+def call_standin(name, slots, state):
+    """Starts the stand-in of release `name`, if one is configured on a card the release left."""
+    standin = read_standins().get(name)
+    footprint = RELEASE_SLOTS[name]["footprint"]
+    s = slots.get(standin) if standin else None
+    if not s or s["card"] in ("cpu", "all") or footprint == "all" or s["card"] == footprint:
+        return None
+    if standin not in existing_containers():
+        return None
+    stop_guests(s["card"], standin)
+    if standin not in running_containers():
+        sh(f"docker start {standin}", timeout=60)
+    state["standin"] = standin
+    return standin
+
+
+def dismiss_standin(state, keep=None):
+    """Leaving the release: the stand-in goes, unless it is the very slot now asked for."""
+    standin = state.pop("standin", None)
+    if standin and standin != keep and standin in running_containers():
+        sh(f"docker stop {standin}", timeout=60)
+    return standin
+
+
+def card_taken(card, slots, state, guest=None):
+    """Does a slot, a load in flight or a release hold this card? Slots the guest shares with
+    do not count as holding it."""
+    declared = state.get("slot")
+    if declared in RELEASE_SLOTS and RELEASE_SLOTS[declared]["footprint"] in (card, "all"):
+        return True
+    running = running_containers()
+    shared = read_guest_shares().get(guest, set()) if guest else set()
+    for name, s in slots.items():
+        if name in shared:
+            continue
+        if s["card"] in (card, "all") and (name in running or name in IN_FLIGHT):
+            return True
+    return False
+
+
+def stop_guests(card, slot=None):
+    """Stops the guests of a card ("all": of every card) before it is taken — except a guest that
+    declares it shares the card with this very slot."""
+    stopped = []
+    running = running_containers()
+    shares = read_guest_shares()
+    for name, c in read_guests().items():
+        if slot and slot in shares.get(name, set()):
+            continue
+        if (card == "all" or c == card) and name in running:
+            sh(f"docker stop {name}", timeout=60)
+            stopped.append(name)
+    return stopped
+
+
+def wake_guests(slots, state):
+    """Starts every guest whose card nothing holds any more."""
+    started = []
+    running, existing = running_containers(), existing_containers()
+    for name, card in read_guests().items():
+        if name in existing and name not in running and not card_taken(card, slots, state, guest=name):
+            sh(f"docker start {name}", timeout=60)
+            started.append(name)
+    return started
+
+
+def size_gb(name, slot):
+    """Size of the weights file, used to estimate the load time."""
+    if slot.get("size_gb") is not None:
+        return float(slot["size_gb"])
+    mod = slot.get("model")
+    if not mod:
+        return 0.0
+    base = os.path.basename(mod)
+    folder = slot["weights"] if slot["weights"].startswith("/") else \
+        os.path.expanduser(f"~/models/{slot['weights']}")
+    # A split model is passed by its first shard (`<model>-00001-of-00005.gguf`): count every shard.
+    split = re.match(r"(.*)-00001-of-(\d{5})\.gguf$", base)
+    files = [f"{split.group(1)}-{i:05d}-of-{split.group(2)}.gguf" for i in range(1, int(split.group(2)) + 1)] \
+        if split else [base]
+    try:
+        return sum(os.path.getsize(os.path.join(folder, f)) for f in files) / 2**30
+    except OSError:
+        return 0.0
+
+
+# ──────────────────────────────────────────────────────── the measurement
+#
+# EVERY SLOT ALREADY CARRIES `--metrics`, and nothing read them. Throughput,
+# the widest context ever served, whether anything ever queued: produced
+# continuously, thrown away continuously.
+#
+# This reads, it never decides. A slot that exposes no /metrics — another
+# engine, an older build — simply has no measurement, and that is a state of
+# its own, distinct from zero.
+METRICS_RE = re.compile(r"^(llamacpp:[a-z_]+)\s+([0-9.eE+-]+)\s*$", re.MULTILINE)
+
+
+def metrics(port, timeout=2.0):
+    """The server's own counters, or None. Never raises: a probe that can bring
+    down the thing it probes is worse than no probe."""
+    if not port:
+        return None
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics",
+                                    timeout=timeout) as f:
+            body = f.read().decode("utf-8", "replace")
+    except Exception:
+        return None
+    raw = {k: float(v) for k, v in METRICS_RE.findall(body)}
+    if not raw:
+        return None
+
+    def r(key, default=None):
+        return raw.get("llamacpp:" + key, default)
+
+    # The rate CUMULATED since startup AND the instantaneous one the server
+    # publishes: both, because they do not say the same thing. The cumulative
+    # one resists a spike, the instantaneous one shows it.
+    tokens = r("tokens_predicted_total", 0.0)
+    seconds = r("tokens_predicted_seconds_total", 0.0)
+    p_tokens = r("prompt_tokens_total", 0.0)
+    p_seconds = r("prompt_seconds_total", 0.0)
+    return {
+        "generation_tok_s_cumul": round(tokens / seconds, 1) if seconds > 0 else None,
+        "generation_tok_s_instant": r("predicted_tokens_seconds"),
+        "prompt_tok_s_cumul": round(p_tokens / p_seconds, 1) if p_seconds > 0 else None,
+        "prompt_tok_s_instant": r("prompt_tokens_seconds"),
+        TOKENS_KEY: int(tokens),
+        "jetons_de_prompt": int(p_tokens),
+        "contexte_le_plus_large_servi": int(r("n_tokens_max", 0)),
+        "requetes_en_cours": int(r("requests_processing", 0)),
+        "requetes_differees": int(r("requests_deferred", 0)),
+        "slots_occupes_par_decodage": r("n_busy_slots_per_decode"),
+    }
+
+
+# The floor that separates "on the card" from "on the processor". Measured on
+# 30/09/2026: a 9B on the 4070 gives ~134 tok/s, a 3B on the processor ~15.
+#
+# This fifth fact exists because VRAM alone is not enough. A model that fell
+# back to the CPU keeps a port that answers and a green probe — the costliest
+# failure on this fleet — and on a shared card the memory floor can be
+# crossed by the NEIGHBOUR, while the watched slot carries nothing.
+# The rate, for its part, is not fooled by a co-tenant.
+#
+# 05/10/2026: 40 tok/s cleared the declaration of Flash-Next (177B MoE, experts streamed from the
+# SSD), a card model that runs at 35 tok/s warm and ~13 on its first cold request — so after a
+# game `restore` went back to the slot declared before it. The floor is now 20 (the measured
+# fallback, 12 tok/s, stays below it) and the rate is judged only after MIN_TOKENS_TO_JUDGE
+# tokens, so a cold first request does not decide alone.
+GPU_RATE_FLOOR = 20.0
+MIN_TOKENS_TO_JUDGE = 1000
+TOKENS_KEY = "jetons_generes"     # the metrics field name, part of the HTTP interface other repos read
+
+
+def rate_credible(measure, card):
+    """Is the rate that of a card, or that of a processor?
+
+    Returns None as long as there is nothing to judge: a slot that has just
+    started has generated no token. Not knowing and finding a fault are two
+    different states, and only one deserves an alert.
+    """
+    if measure is None or card == "cpu":
+        return None
+    d = measure.get("generation_tok_s_cumul")
+    if d is None or measure.get(TOKENS_KEY, 0) < MIN_TOKENS_TO_JUDGE:
+        return None
+    return d >= GPU_RATE_FLOOR
+
+
+# ──────────────────────────────────────────────────────── the four facts
+
+STAGES = [
+    ("starting", r"common_params_print_info"),
+    ("reading_weights", r"load_model: loading model"),
+    ("initialising", r"load_model: initializing"),
+    ("ready", r"listening on"),
+    # The Strata engine (a MoE engine that streams the experts) says the same things in its own words.
+    ("starting", r"\[strata\] starting the engine"),
+    ("reading_weights", r"\[strata\] loading the experts"),
+    ("initialising", r"\[strata\] filling the GPU's expert cache"),
+    ("ready", r"^ready: http://"),
+]
+
+
+def read_log_since(name, since):
+    """The lines written SINCE a given instant.
+
+    Two traps, paid one after the other.
+
+    One: `docker logs` returns the whole history. On a container's second
+    start, the previous run's "listening on" is already there, and a loop
+    looking for it concludes in 0.0 s having waited for nothing — a swap
+    counted as instantly successful, which then poisons the estimator.
+
+    Two: a date with no timezone is read by docker in LOCAL time. On a
+    machine in CEST that requested two extra hours of history, so the whole
+    log again. A Unix timestamp has no timezone.
+    """
+    return sh(f"docker logs --since {int(since)} {name} 2>&1 | tail -40")
+
+
+def read_log(name, lines=60):
+    """The STARTUP lines, so the BEGINNING of the log.
+
+    A `--tail` loses them as soon as a server has been up for a few hours: a
+    model up for 13 hours came out "diverging" while it was serving fine.
+    The model name and the context actually granted are written once, at
+    startup, and never change afterwards."""
+    return sh(f"docker logs {name} 2>&1 | head -{lines}")
+
+
+def stage_and_model(log):
+    """The stage reached, the model actually loaded, the context granted."""
+    stage, model, context = None, None, None
+    for stage_name, pattern in STAGES:
+        if re.search(pattern, log, re.MULTILINE):
+            stage = stage_name
+    m = re.search(r"load_model: loading model '([^']+)'", log)
+    if m:
+        model = m.group(1)
+    c = re.search(r"n_ctx_slot = (\d+)", log)
+    if c:
+        context = int(c.group(1))
+    return stage, model, context
+
+
+def memory_used():
+    """Used memory per card, in mebibytes, whatever the vendor."""
+    if TOOL == "nvidia":
+        out = sh("nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits")
+        return [int(x) for x in out.split() if x.isdigit()]
+    if TOOL.startswith("amd"):
+        return _memory_amd()
+    if TOOL == "intel":
+        # xpu-smi reports mebibytes in "GPU Memory Used".
+        try:
+            d = json.loads(sh("xpu-smi stats -d -1 -j"))
+            v = []
+            for c in (d.get("device_list") or d.get("devices") or []):
+                for k, x in c.items():
+                    if "memory" in k.lower() and "used" in k.lower():
+                        v.append(int(float(str(x).split()[0])))
+                        break
+            return v
+        except Exception:
+            return []
+    return []
+
+
+def port_answers(port):
+    if not port:
+        return False
+    s = socket.socket()
+    s.settimeout(1.5)
+    try:
+        s.connect(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def running_containers():
+    return set(sh('docker ps --format "{{.Names}}"').split())
+
+
+def existing_containers():
+    """Every container, running or stopped: a slot can only start if it exists.
+
+    The turnstile STARTS containers, it does not create them. Asked for a slot
+    whose container was never created, it used to stop the slot holding the
+    card first and only then fail on `docker start`: the card was left empty
+    and the assistant gone (02/10/2026, a new 27B slot)."""
+    return set(sh('docker ps -a --format "{{.Names}}"').split())
+
+
+def external_users():
+    """Everything holding a card, Docker or NOT.
+
+    The probe only looked at `docker ps`. But an image and video studio —
+    ComfyUI, Wan, Flux, LTX, transcription models — runs as native
+    processes, invisible to Docker and yet very hungry for card memory.
+    Without this read, the turnstile declares "memory consistent" on a card
+    that Flux is occupying, then fails to load a slot without understanding
+    why.
+
+    These programs keep their own card, held by hand: the turnstile does not
+    drive them. But it must SEE them, or it judges a card while ignoring
+    half of its tenants.
+    """
+    if TOOL == "nvidia":
+        out = sh("nvidia-smi --query-compute-apps=pid,used_memory,name "
+                 "--format=csv,noheader,nounits")
+    elif TOOL.startswith("amd"):
+        # rocm-smi reports "pid, name, memory"; the column order differs,
+        # hence the normalisation below.
+        raw = sh("rocm-smi --showpids --csv")
+        lines = []
+        for l in raw.splitlines()[1:]:
+            p = [x.strip() for x in l.split(",")]
+            if len(p) >= 3 and p[0].isdigit():
+                mib = p[2]
+                if mib.isdigit() and int(mib) > 1 << 20:
+                    mib = str(int(mib) >> 20)
+                lines.append(f"{p[0]}, {mib}, {p[1]}")
+        out = "\n".join(lines)
+    else:
+        out = ""
+    outside = []
+    for l in out.splitlines():
+        p = [x.strip() for x in l.split(",")]
+        if len(p) < 3:
+            continue
+        pid, mib, name = p[0], p[1], ",".join(p[2:])
+        if not mib.isdigit() or int(mib) < 200:
+            continue                       # desktop compositor noise
+        # An inference server of the grid runs INSIDE a container: its
+        # executable is llama-server. Everything else is an external user.
+        if "llama-server" in name:
+            continue
+        outside.append({"pid": int(pid), "mib": int(mib),
+                        "program": os.path.basename(name)[:60]})
+    return outside
+
+
+def observe(slots):
+    """THE REAL STATE. Declares nothing, corrects nothing: it READS."""
+    running = running_containers()
+    mem = memory_used()
+    live, manual = {}, []
+
+    for name in running:
+        if name not in slots:
+            if name not in IGNORE:
+                manual.append(name)         # respected, never overwritten
+            continue
+        slot = slots[name]
+        stage, model, context = stage_and_model(read_log(name))
+        idx = slot["card"]
+        card_mem = None
+        if idx.isdigit() and int(idx) < len(mem):
+            card_mem = mem[int(idx)]
+        elif idx == "all":
+            card_mem = sum(mem)
+
+        measure = metrics(slot["port"])
+
+        # FIVE facts now, each one named. The fifth was added on
+        # 30/09/2026: memory says a card carries SOMETHING, the rate says it
+        # is INDEED THIS SLOT that carries it. On a shared card, the first
+        # can be true because of the neighbour.
+        facts = {
+            "container_running": True,
+            "port_answers": port_answers(slot["port"]),
+            "memory_consistent": (card_mem is None) or (card_mem > CARD_FLOOR),
+            "model_as_expected": (model == slot["model"]) if model else None,
+            "throughput_credible": rate_credible(measure, idx),
+        }
+        if stage == "ready" and all(f is not False for f in facts.values()):
+            status = "serving"
+        elif stage in ("starting", "reading_weights", "initialising"):
+            status = "loading"
+        else:
+            status = "diverging"
+
+        live[name] = {
+            "status": status,
+            "stage": stage,
+            "facts": facts,
+            "card": idx,
+            "memory_mib": card_mem,
+            "model_loaded": model,
+            "context_granted": context,
+            "context_requested": slot["context_requested"],
+            "context_capped": (context is not None
+                               and slot["context_requested"] is not None
+                               and context < slot["context_requested"]),
+            # The server's measurement, as it publishes it. `None` means
+            # "no /metrics on this port", not "zero".
+            "mesure": measure,
+            # What the largest context ever served says about the window
+            # granted: a window of 196 608 never used beyond 5 000 costs
+            # VRAM for nothing, and that is a fact, not an opinion.
+            "contexte_employe_part": (
+                round(measure["contexte_le_plus_large_servi"] / context, 3)
+                if measure and context else None),
+        }
+
+    outside = external_users()
+    return {
+        # The version first: it is the first thing you want to read when a
+        # state is surprising, and the only one that says whether the machine
+        # runs what the repository describes.
+        "version": VERSION,
+        "slots_live": live,
+        "manual_containers": manual,
+        # Studio programs and anything else holding a card outside Docker.
+        # The turnstile does not drive them; it counts them so it does not
+        # get the free space wrong.
+        "external_users": outside,
+        "memory_taken_externally_mib": sum(o["mib"] for o in outside),
+        "release_slots": {n: dict(s) for n, s in RELEASE_SLOTS.items()},
+        "memory_per_card_mib": mem,
+        "free_cards": [i for i, m in enumerate(mem) if m < CARD_FLOOR],
+        "vendor": TOOL,
+        "timestamp": time.time(),
+    }
+
+
+# ─────────────────────────────────────────────────────────── the counters
+
+def empty_counters():
+    return {
+        "swaps_requested": 0, "swaps_succeeded": 0, "failures": 0,
+        "queued": 0, "divergences_seen": 0, "wait_total_s": 0.0,
+        "rate_limited": 0,
+        # MEASURE 2 — the reuse rate. Share of requests landing on a slot
+        # ALREADY serving, so with zero wait. This is the one that says
+        # whether the grid matches how the machine is used: 90 % means well
+        # cut, 10 % means cut wrong.
+        "requests_total": 0, "requests_already_serving": 0,
+        # MEASURE 3 — dwell time per slot. A slot that lasts 20 s signals an
+        # oscillation; a slot that lasts 4 hours is well chosen.
+        "dwell_s": {}, "dwell_n": {},
+        "since": time.time(),
+    }
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            e = json.load(f)
+    except (OSError, ValueError):
+        e = {}
+    base = {"slot": None, "slot_since": None, "previous_slot": None,
+            "counters": empty_counters(), "measurements": []}
+    for k, v in base.items():
+        e.setdefault(k, v)
+    for k, v in empty_counters().items():
+        e["counters"].setdefault(k, v)
+    return e
+
+
+# ─── MEASURE 1: the estimator that teaches itself ────────────────────
+#
+# Every real swap produces a point (profile, size, duration). Past
+# MIN_POINTS for a profile, the median of the observed s/GB replaces the
+# seed. Nobody has to tune anything: the guessed constant steps aside for
+# the measurement.
+
+def profile(name, slots):
+    s = slots.get(name, {})
+    two = s.get("card") == "all"
+    cmd = sh(f'docker inspect {name} --format "{{{{join .Config.Cmd \\" \\"}}}}"')
+    return (2 if two else 1, "mmap" in cmd or "load-mode mmap" in cmd)
+
+
+def seconds_per_gb(prof, measurements):
+    pts = [m["s_per_gb"] for m in measurements
+           if tuple(m["profile"]) == tuple(prof) and m["s_per_gb"] > 0]
+    if len(pts) >= MIN_POINTS:
+        return statistics.median(pts)
+    return SEEDS.get(tuple(prof), 0.33)
+
+
+def learn_duration(state, name, prof, gb, duration):
+    if gb <= 0:
+        return
+    state["measurements"].append({
+        "slot": name, "profile": list(prof), "size_gb": round(gb, 2),
+        "duration_s": round(duration, 2), "s_per_gb": round(duration / gb, 4),
+        "when": time.time(),
+    })
+    state["measurements"] = state["measurements"][-200:]     # sliding window
+
+
+def save_state(e):
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(e, f, indent=2)
+    os.replace(tmp, STATE_FILE)
+
+
+# ────────────────────────────────────────────────────────────── the swap
+
+LOCK = threading.Lock()
+IN_FLIGHT = {}       # name -> {started, size_gb, profile}
+QUEUE = []           # requests that arrived during a load
+
+
+def pending_queue():
+    """The names still waiting behind a load in flight.
+
+    The list is bookkeeping for clients that poll for their slot: once nothing is
+    loading, nobody is behind anything, so it empties. It used to be append-only,
+    and a single request that arrived during a load kept /state saying "queue not
+    empty" until the daemon restarted, which froze every client that waits for an
+    empty queue."""
+    with LOCK:
+        if not IN_FLIGHT:
+            QUEUE.clear()
+        return list(QUEUE)
+
+
+def release(name, slots, state):
+    """Hands a footprint back: unloads whatever holds it, loads nothing.
+
+    CPU slots are never touched: they hold no card, and one of them is the
+    model that has to keep answering while a swap is in progress."""
+    footprint = RELEASE_SLOTS[name]["footprint"]
+    state["counters"]["swaps_requested"] += 1
+    started, stopped = time.time(), stop_guests(footprint)
+    for other, s in slots.items():
+        if s["card"] == "cpu" or other not in running_containers():
+            continue
+        if s["card"] == footprint or "all" in (s["card"], footprint):
+            sh(f"docker stop {other}", timeout=60)
+            stopped.append(other)
+    # Every slot the release stopped comes back with the card (bring_back), not only the declared one:
+    # with a model on each card, `restore` named the 27B on card 1, and the coder of card 0 stayed off
+    # after the game (04/10/2026).
+    state["released_slots"] = [n for n in stopped if n in slots]
+    time.sleep(2)
+    mem = memory_used()
+    if footprint == "all":
+        remaining = sum(mem)
+    else:
+        i = int(footprint)
+        remaining = mem[i] if i < len(mem) else 0
+    duration = time.time() - started
+    free = remaining < CARD_FLOOR
+    state["counters"]["wait_total_s"] += duration
+    if free:
+        state["counters"]["swaps_succeeded"] += 1
+        remember_previous(state, name)
+        state["slot"] = name
+        state["slot_since"] = time.time()
+    else:
+        state["counters"]["failures"] += 1
+    standin = call_standin(name, slots, state) if free else None
+    save_state(state)
+    wake_guests(slots, state)                  # the OTHER cards' guests, if they were waiting
+    return {"state": "served" if free else "still_busy", "slot": name, "standin": standin,
+            "duration_s": round(duration, 1), "stopped": stopped,
+            "memory_remaining_mib": remaining,
+            "external_users": [] if free else external_users(),
+            "purpose": RELEASE_SLOTS[name]["purpose"]}
+
+
+# ── remembering, so a game can hand the card back ───────────────────────
+#
+# A game takes a card by asking for a release slot, and gives it back when it
+# quits. Something has to remember what was serving before.
+#
+# It used to be three programs: a game watcher called a game script, which
+# called a phase tool, which called a CLI, which called this service. Four
+# links to say "free card 0, then put it back". Each one held a piece of the
+# answer and none of them held the state, so the one that knew what to
+# restore had written it down in a file of its own.
+#
+# The service already keeps the current slot. Keeping the one before it costs
+# one field, and removes three programs.
+RESTORE = "restore"
+
+
+def remember_previous(state, new_name):
+    """Records the slot being left, unless we are already going back to it."""
+    current = state.get("slot")
+    if current and current != new_name:
+        state["previous_slot"] = current
+
+
+def resolve(name, state):
+    """Turns the `restore` alias into the slot that was serving before.
+
+    Returns None when there is nothing to go back to — a fresh service, or a
+    restore asked twice. The caller answers `nothing_to_restore` rather than
+    guessing a slot, because guessing here would load a model nobody asked
+    for.
+    """
+    if name != RESTORE:
+        return name
+    return state.get("previous_slot")
+
+
+def bring_back(slots, state, skip_card=None):
+    """After a release ends: start again the slots it stopped, except on the card a new slot just took.
+    Guests are woken after, by wake_guests, so a guest sharing its card with one of them comes back too."""
+    started = []
+    running = running_containers()
+    for name in state.pop("released_slots", None) or []:
+        s = slots.get(name)
+        if not s or name in running or (skip_card and (s["card"] == skip_card or "all" in (s["card"], skip_card))):
+            continue
+        sh(f"docker start {name}", timeout=60)
+        started.append(name)
+    save_state(state)
+    return started
+
+
+def swap(name, slots, state):
+    """Starts a slot and follows its load. Never kills the one in flight."""
+    if name == RESTORE:
+        target = resolve(name, state)
+        if not target:
+            return {"state": "nothing_to_restore",
+                    "reason": "no slot was recorded before the current one"}
+        name = target
+    if name in RELEASE_SLOTS:
+        return release(name, slots, state)
+    if name not in slots:
+        return {"state": "unknown", "slot": name}
+    if name not in existing_containers():
+        # Checked BEFORE anything is stopped: refusing costs nothing, a stop
+        # followed by a failed start leaves the card empty.
+        return {"state": "no_container", "slot": name,
+                "reason": "the slot's container does not exist: create it from its "
+                          "map line, then ask again; nothing was stopped"}
+
+    # Rate ceiling: count the swaps of the last hour.
+    recent = [m for m in state.get("measurements", [])
+              if time.time() - m.get("when", 0) < 3600]
+    if len(recent) >= MAX_SWAPS_PER_HOUR:
+        state["counters"]["rate_limited"] += 1
+        save_state(state)
+        return {"state": "rate_limited",
+                "swaps_last_hour": len(recent),
+                "ceiling": MAX_SWAPS_PER_HOUR,
+                "reason": "too many swaps in one hour: a client is probably looping",
+                "retry_in_s": 300}
+
+    with LOCK:
+        if IN_FLIGHT:
+            ahead = next(iter(IN_FLIGHT))
+            left = remaining_estimate(ahead, state)
+            QUEUE.append(name)
+            state["counters"]["queued"] += 1
+            save_state(state)
+            return {"state": "queued", "ahead": ahead, "estimated_wait_s": left}
+        IN_FLIGHT[name] = {"started": time.time(),
+                           "size_gb": size_gb(name, slots[name]),
+                           "profile": profile(name, slots)}
+
+    state["counters"]["swaps_requested"] += 1
+    slot = slots[name]
+
+    # Free whatever holds the same footprint.
+    #
+    # Three things are NEVER stopped:
+    #   - a manual container: it is not in the map, the loop never sees it
+    #   - a CPU slot: it holds no card at all
+    #   - anything outside the map, such as a gateway
+    #
+    # The second point was paid for: "all" made the condition true for
+    # everyone, including `card == cpu`. Three swaps killed the two CPU
+    # models that had been up for twelve hours — which is to say, exactly
+    # the models meant never to swap and to hold the line during loads.
+    for other, s in slots.items():
+        if other == name or s["card"] == "cpu":
+            continue
+        if other not in running_containers():
+            continue
+        same_card = s["card"] == slot["card"]
+        overlaps = "all" in (s["card"], slot["card"])
+        if same_card or overlaps:
+            sh(f"docker stop {other}", timeout=60)
+
+    if slot["card"] != "cpu":
+        stop_guests(slot["card"], name)
+    started = time.time()
+    deadline = load_deadline(IN_FLIGHT.get(name, {}).get("size_gb", 0))
+    sh(f"docker start {name}", timeout=60)
+    result = "failed"
+    while time.time() - started < deadline:
+        log = read_log_since(name, started - 2)
+        stage, _, _ = stage_and_model(log)
+        if stage == "ready":
+            result = "served"
+            break
+        if re.search(r"^error|invalid argument|out of memory|ggml_abort",
+                     log, re.MULTILINE | re.IGNORECASE):
+            break
+        if name not in running_containers():
+            break
+        time.sleep(1)
+
+    duration = time.time() - started
+    with LOCK:
+        info = IN_FLIGHT.pop(name, {})
+    state["counters"]["wait_total_s"] += duration
+
+    if result == "served":
+        state["counters"]["swaps_succeeded"] += 1
+        # MEASURE 3: close the previous slot's dwell before opening the new.
+        previous, since = state.get("slot"), state.get("slot_since")
+        if previous and since:
+            d = state["counters"]["dwell_s"]
+            n = state["counters"]["dwell_n"]
+            d[previous] = round(d.get(previous, 0.0) + (time.time() - since), 1)
+            n[previous] = n.get(previous, 0) + 1
+        remember_previous(state, name)
+        state["slot"] = name
+        state["slot_since"] = time.time()
+        # MEASURE 1: this load becomes a measurement point.
+        learn_duration(state, name, info.get("profile", (1, False)),
+                       info.get("size_gb", 0), duration)
+    else:
+        state["counters"]["failures"] += 1
+
+    save_state(state)
+    wake_guests(slots, state)                  # the card it left, if that one is now empty
+    return {"state": result, "slot": name, "duration_s": round(duration, 1)}
+
+
+def remaining_estimate(name, state=None):
+    """The in-between state: time left, not just the stage name.
+
+    The estimate rests on the REAL durations already observed for the same
+    loading profile, and falls back to the seed while there are too few.
+    """
+    e = IN_FLIGHT.get(name)
+    if not e:
+        return 0
+    spg = seconds_per_gb(e.get("profile", (1, False)),
+                         (state or {}).get("measurements", []))
+    expected = BASE_SECONDS + e["size_gb"] * spg
+    return max(0, round(expected - (time.time() - e["started"]), 1))
+
+
+# ─────────────────────────────────────────────────────────── the probe
+
+BOOT_WINDOW_S = 900       # a declared slot is brought back only if the machine booted less than this ago
+
+
+def boot_id():
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def uptime_s():
+    try:
+        with open("/proc/uptime") as f:
+            return float(f.read().split()[0])
+    except (OSError, ValueError):
+        return 1e9
+
+
+def restore_after_boot(state, current_boot_id, uptime):
+    """Was the declared slot lost because the machine rebooted, and not yet brought back in this boot?
+
+    A reboot empties both cards and the containers do not restart on their own (restart=no). Until 13/10/2026 the
+    probe then cleared the declaration (12/10: the 27B declared on the 4070 was dropped 16 seconds after boot and nothing
+    loaded it again). A restart of this daemon alone must not reload anything: it is once per boot, soon after it."""
+    return bool(current_boot_id) and state.get("boot_id") != current_boot_id and uptime < BOOT_WINDOW_S
+
+
+def probe_loop(slots_ref, state):
+    while True:
+        try:
+            obs = observe(slots_ref[0])
+            diverging = [n for n, s in obs["slots_live"].items()
+                         if s["status"] == "diverging"]
+            if diverging:
+                state["counters"]["divergences_seen"] += len(diverging)
+                save_state(state)
+
+            # A DECLARED SLOT MUST NEVER OUTLIVE ITS CONTAINER.
+            #
+            # A container killed after being served left the declaration
+            # intact. The probe saw the slot disappear, but the state kept
+            # asserting it was serving — exactly the divergence this whole
+            # project exists to remove, reintroduced by the state itself.
+            #
+            # A release slot stays declared: it has no container to lose.
+            slot = state.get("slot")
+            if slot and slot not in RELEASE_SLOTS and not IN_FLIGHT:
+                status = obs["slots_live"].get(slot, {}).get("status")
+                if status != "serving" and restore_after_boot(state, boot_id(), uptime_s()):
+                    state["boot_id"] = boot_id()
+                    save_state(state)
+                    print(f"boot: bringing back the declared slot {slot}", file=sys.stderr, flush=True)
+                    threading.Thread(target=swap, args=(slot, slots_ref[0], state), daemon=True).start()
+                elif status != "serving":
+                    state["counters"]["divergences_seen"] += 1
+                    state["slot_lost"] = {"slot": slot,
+                                          "status": status or "absent",
+                                          "when": time.time()}
+                    state["slot"] = None
+                    state["slot_since"] = None
+                    save_state(state)
+                    print(f"slot {slot} lost ({status or 'absent'}): "
+                          "declaration cleared", file=sys.stderr, flush=True)
+        except Exception as exc:                       # the probe never dies
+            print(f"probe: {exc}", file=sys.stderr)
+        time.sleep(PROBE_PERIOD)
+
+
+# ───────────────────────────────────────────────────────────── the API
+
+def make_handler(slots_ref, state):
+    class H(http.server.BaseHTTPRequestHandler):
+        def _send(self, code, body):
+            b = json.dumps(body, indent=2, ensure_ascii=False).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+        def _authorised(self, write):
+            if not TOKEN:
+                return True
+            given = self.headers.get("Authorization", "")
+            if hmac.compare_digest(given, f"Bearer {TOKEN}"):
+                return True
+            if not write and READ_TOKEN and hmac.compare_digest(given, f"Bearer {READ_TOKEN}"):
+                return True
+            self._send(401, {"error": "missing or wrong bearer token"
+                             if not write else "this route needs the read-write token"})
+            return False
+
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            if not self._authorised(write=False):
+                return
+            if self.path.startswith("/state"):
+                obs = observe(slots_ref[0])
+                obs["declared_slot"] = state["slot"]
+                obs["previous_slot"] = state.get("previous_slot")
+                obs["loading"] = {
+                    n: {"estimated_remaining_s": remaining_estimate(n, state),
+                        "size_gb": round(IN_FLIGHT[n]["size_gb"], 1),
+                        "profile": list(IN_FLIGHT[n]["profile"])}
+                    for n in IN_FLIGHT}
+                obs["queue"] = pending_queue()
+                self._send(200, obs)
+            elif self.path.startswith("/counters"):
+                c = dict(state["counters"])
+                c["hours_since"] = round((time.time() - c["since"]) / 3600, 1)
+                d = c["swaps_requested"]
+                c["success_rate"] = round(c["swaps_succeeded"] / d, 3) if d else None
+                t = c["requests_total"]
+                # MEASURE 2: the share served with no swap says whether the
+                # grid matches real use. High = well cut.
+                c["reuse_rate"] = (round(c["requests_already_serving"] / t, 3)
+                                   if t else None)
+                # MEASURE 3: mean dwell per slot. Short = oscillation.
+                c["mean_dwell_s"] = {
+                    k: round(v / c["dwell_n"][k], 1)
+                    for k, v in c["dwell_s"].items() if c["dwell_n"].get(k)}
+                # MEASURE 1: what the estimator learned, per profile.
+                learned = {}
+                for m in state.get("measurements", []):
+                    learned.setdefault(tuple(m["profile"]), []).append(m["s_per_gb"])
+                c["learned_seconds_per_gb"] = {
+                    f"{k[0]} card{'s' if k[0] > 1 else ''}{', mmap' if k[1] else ''}":
+                    {"median": round(statistics.median(v), 3), "points": len(v),
+                     "still_using_seed": len(v) < MIN_POINTS}
+                    for k, v in learned.items()}
+                c["measurements_recorded"] = len(state.get("measurements", []))
+                self._send(200, c)
+            elif self.path.startswith("/slots"):
+                self._send(200, {"slots": slots_ref[0],
+                                 "release_slots": RELEASE_SLOTS,
+                                 "aliases": {RESTORE: state.get("previous_slot")}})
+            elif self.path.startswith("/health"):
+                self._send(200, {"ok": True, "slots": len(slots_ref[0]),
+                                 "vendor": TOOL, "cards": len(CARD_INDEX)})
+            else:
+                self._send(404, {"error": "unknown route",
+                                 "routes": ["/state", "/counters", "/slots",
+                                            "/health", "POST /slot", "POST /pair"]})
+
+        def do_POST(self):
+            if not self._authorised(write=True):
+                return
+            if self.path.startswith("/pair"):
+                # Archive one judgment pair. Append only, never rewritten:
+                # the corpus cannot lose what it already holds.
+                n = int(self.headers.get("Content-Length", 0))
+                try:
+                    line = json.loads(self.rfile.read(n) or b"{}")
+                except ValueError:
+                    return self._send(400, {"error": "unreadable json"})
+                # An unwritable corpus used to kill the handler and CLOSE the
+                # connection with no message. The service survived, but the
+                # caller got a raw cut instead of a refusal. Losing a pair is
+                # tolerable; lying about why is not.
+                try:
+                    os.makedirs(os.path.dirname(CORPUS), exist_ok=True)
+                    with open(CORPUS, "a") as f:
+                        f.write(json.dumps(line, ensure_ascii=False) + "\n")
+                    with open(CORPUS) as f:
+                        total = sum(1 for _ in f)
+                    return self._send(201, {"archived": True, "pairs": total})
+                except OSError as exc:
+                    return self._send(507, {
+                        "archived": False, "error": str(exc)[:120],
+                        "consequence": "pair lost, the service carries on"})
+            if not self.path.startswith("/slot"):
+                return self._send(404, {"error": "unknown route"})
+            n = int(self.headers.get("Content-Length", 0))
+            try:
+                d = json.loads(self.rfile.read(n) or b"{}")
+            except ValueError:
+                return self._send(400, {"error": "unreadable json"})
+            wanted = d.get("slot")
+            if not wanted:
+                return self._send(400, {"error": "field 'slot' is required",
+                                        "slots": sorted(slots_ref[0]),
+                                        "release_slots": sorted(RELEASE_SLOTS),
+                                        "aliases": [RESTORE]})
+            # Resolve the alias BEFORE anything looks at it.
+            #
+            # Measured the day it was written: `restore` reached the
+            # already-serving test under its own name, matched nothing, and
+            # went on to load a model that was already up. `docker start` on
+            # a running container does nothing, so the loop waited 30 s for a
+            # startup line that was never coming again, and reported a
+            # failure on a slot that was serving correctly the whole time.
+            #
+            # An alias that is not resolved at the door is a second name for
+            # the same thing — and this service exists to stop one thing
+            # having two answers.
+            if wanted == RESTORE:
+                target = resolve(wanted, state)
+                if not target:
+                    return self._send(200, {
+                        "state": "nothing_to_restore",
+                        "reason": "no slot was recorded before the current one"})
+                wanted = target
+            slots_ref[0] = read_map()
+            obs = observe(slots_ref[0])
+            already = obs["slots_live"].get(wanted, {}).get("status")
+            state["counters"]["requests_total"] += 1
+            if already == "serving":
+                # MEASURE 2: request served with no swap at all.
+                state["counters"]["requests_already_serving"] += 1
+                # The declaration follows, even with no swap.
+                #
+                # It did not, and that produced the very lie this service
+                # exists to remove: after a game handed a card back, the slot
+                # was serving correctly while `declared_slot` still read
+                # `free-c0`. Nothing had failed — the request was simply
+                # answered without anyone writing down what it meant.
+                #
+                # A request that is satisfied IS a slot change, even when it
+                # costs zero seconds.
+                if state.get("slot") != wanted:
+                    remember_previous(state, wanted)
+                    state["slot"] = wanted
+                    state["slot_since"] = time.time()
+                save_state(state)
+                # Leaving a release (`restore` after a game) costs no swap but
+                # frees a card: what the release stopped comes back, then its
+                # guests, or they would wait for the next real swap (03/10/2026).
+                if wanted not in RELEASE_SLOTS:
+                    dismiss_standin(state, keep=wanted)
+                    bring_back(slots_ref[0], state)
+                wake_guests(slots_ref[0], state)
+                return self._send(200, {"state": "already_serving",
+                                        "slot": wanted, "wait_s": 0})
+            if wanted not in RELEASE_SLOTS and state.get("standin"):
+                dismiss_standin(state, keep=wanted)
+            result = swap(wanted, slots_ref[0], state)
+            if wanted not in RELEASE_SLOTS and result.get("state") == "served" and state.get("released_slots"):
+                bring_back(slots_ref[0], state, skip_card=slots_ref[0].get(wanted, {}).get("card"))
+                wake_guests(slots_ref[0], state)
+            self._send(202, result)
+
+    return H
+
+
+class Server(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def main():
+    slots_ref = [read_map()]
+    state = load_state()
+    if not slots_ref[0]:
+        print(f"no slot read: {MAP} is empty or unreadable", file=sys.stderr)
+        return 1
+
+    if len(sys.argv) > 1 and sys.argv[1] == "state":
+        print(json.dumps(observe(slots_ref[0]), indent=2, ensure_ascii=False))
+        return 0
+    if len(sys.argv) > 2 and sys.argv[1] == "slot":
+        print(json.dumps(swap(sys.argv[2], slots_ref[0], state), indent=2))
+        return 0
+
+    threading.Thread(target=probe_loop, args=(slots_ref, state),
+                     daemon=True).start()
+    woken = wake_guests(slots_ref[0], state)
+    if woken:
+        print(f"turnstile: guests started: {', '.join(woken)}")
+    print(f"turnstile: {len(slots_ref[0])} slots · {len(CARD_INDEX)} "
+          f"{TOOL} card(s) · probing every {PROBE_PERIOD} s · API on "
+          f"{BIND}:{PORT}")
+    if BIND not in ("127.0.0.1", "localhost", "::1") and not TOKEN:
+        print("  WARNING: reachable from the network with no token. Set "
+              "TURNSTILE_TOKEN, or bind to 127.0.0.1.", file=sys.stderr)
+    if READ_TOKEN and READ_TOKEN == TOKEN:
+        print("  WARNING: TURNSTILE_READ_TOKEN equals TURNSTILE_TOKEN: the "
+              "read-only token can swap.", file=sys.stderr)
+    with Server((BIND, PORT), make_handler(slots_ref, state)) as s:
+        s.serve_forever()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

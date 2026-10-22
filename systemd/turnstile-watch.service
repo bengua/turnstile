@@ -1,0 +1,17 @@
+[Unit]
+Description=turnstile watcher — asks for a slot based on observed activity
+After=turnstiled.service
+OnFailure=turnstile-alert@%n.service
+
+[Service]
+Type=simple
+# WITHOUT --act: it records what it WOULD have done, and touches nothing.
+# Read that journal for a few days, check it is not wrong, and only then add
+# --act. An automaton that takes the cards on day one gets disarmed on its
+# first mistake.
+ExecStart=%h/.local/bin/turnstile-watch
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,47 @@
+# ── The slot map ────────────────────────────────────────────────────────
+#
+#   name | port | card | weights folder | arguments
+#
+#   card    a driver index (0, 1, …), `all` for a model split across every
+#           card, or `cpu` for a model that never touches a GPU
+#   weights an absolute path, or a folder name relative to ~/models
+#
+# ONE CONTAINER PER SLOT, including when two slots serve the SAME weights
+# file on two different cards. A container freezes its command line when it
+# is created, so a slot that shared a container would need recreating on
+# every swap — which is exactly the kind of hidden step that makes a map
+# drift away from the machine.
+#
+# The names below are illustrative. Replace them with your own; the
+# turnstile reads this file on every request, so there is nothing to restart
+# after an edit.
+#
+# ── The grid this describes ─────────────────────────────────────────────
+#
+#   footprint   card 1 alone | card 0 alone | both together
+#   preset      standard | coder | generalist | fast | long | big
+#
+# A preset name means the same thing on every footprint. The release slots
+# (free-c0, free-c1, free-all) are NOT listed here: they load nothing, and
+# the service derives them from the cards it discovers.
+
+# ── card 1: the assistant that is always there ──────────────────────────
+assistant-c1|8095|1|my-9b|--host 0.0.0.0 --port 8095 -m /models/my-9b-Q8_0.gguf -c 32768 -ngl 99
+coder-c1|8100|1|my-14b|--host 0.0.0.0 --port 8100 -m /models/my-14b-Q6_K.gguf -c 32768 -ngl 99
+generalist-c1|8101|1|my-12b|--host 0.0.0.0 --port 8101 -m /models/my-12b-Q6_K.gguf -c 32768 -ngl 99
+
+# ── card 0: the card you allocate ───────────────────────────────────────
+coder-c0|8110|0|my-14b|--host 0.0.0.0 --port 8110 -m /models/my-14b-Q6_K.gguf -c 32768 -ngl 99
+generalist-c0|8111|0|my-12b|--host 0.0.0.0 --port 8111 -m /models/my-12b-Q6_K.gguf -c 32768 -ngl 99
+
+# ── both cards: what does not fit on one ────────────────────────────────
+big-x2|8120|all|my-27b|--host 0.0.0.0 --port 8120 -m /models/my-27b-IQ4_XS.gguf -c 26624 -ngl 99 -ts 1,1
+long-x2|8121|all|my-9b|--host 0.0.0.0 --port 8121 -m /models/my-9b-Q8_0.gguf -c 131072 -ngl 99 -ts 1,1
+
+# ── CPU: never stopped, answers during every swap ───────────────────────
+#
+# This is the one that keeps the machine usable while a card is loading.
+# The swap logic skips `cpu` slots explicitly — an earlier version did not,
+# and killed them.
+fallback|8084|cpu|my-3b|--host 0.0.0.0 --port 8084 -m /models/my-3b-Q6_K.gguf -c 8192
+completion|8085|cpu|my-1.5b|--host 0.0.0.0 --port 8085 -m /models/my-1.5b-Q6_K.gguf -c 8192

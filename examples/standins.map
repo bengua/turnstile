@@ -1,0 +1,7 @@
+# release|slot — while a release holds its card, this slot stands in on ANOTHER card.
+#
+# The big model lives on card 0; a game takes card 0 (`free-c0`). The stand-in starts
+# on card 1 (card 1's guests yield to it, like to any slot) and stops when the release
+# ends, so card 1's guests come back. It is never declared: `restore` still returns to
+# what served before the game.
+free-c0|assistant-27b-c1

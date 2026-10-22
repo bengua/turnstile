@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""turnstile-watch — the turnstile turns on its own, following what you do.
+
+THE LAST PIECE.
+
+Until this, you had to ASK for a slot. This watcher looks at what is
+happening on the machine and asks in your place: you open your chat client,
+the right model loads; you launch a game, a card is freed; you start a
+render, every card is handed back.
+
+WHAT THE SETTLE DELAY IS FOR, AND IT IS NOT COMFORT.
+
+Without it the machine flaps: you glance at the chat for thirty seconds
+while an agent is coding, the machine swaps, the job dies, it swaps back.
+Twenty seconds of CONTINUOUS activity before moving, and a brief glance
+triggers nothing at all.
+
+BY DEFAULT IT DOES NOT ACT.
+
+It records what it WOULD have done. You read that journal for a few days,
+check that it is not wrong, and only then hand it the controls with
+--act. An automaton that takes the cards on day one gets disarmed on its
+first mistake, and rightly so.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+
+API = os.environ.get("TURNSTILE_API", "http://127.0.0.1:8130")
+TOKEN = os.environ.get("TURNSTILE_TOKEN", "")
+MAP = os.path.expanduser(
+    os.environ.get("TURNSTILE_HARNESS_MAP", "~/.config/turnstile/harness.map"))
+JOURNAL = os.path.expanduser("~/.local/state/turnstile/watch.jsonl")
+PERIOD = 5            # seconds between two looks
+SETTLE = 20           # seconds of continuous activity before moving
+
+
+def sh(c, t=10):
+    try:
+        return subprocess.run(c, shell=True, capture_output=True,
+                              text=True, timeout=t, check=False).stdout
+    except subprocess.TimeoutExpired:
+        return ""
+
+
+def api(path, body=None, t=120):
+    headers = {"Authorization": f"Bearer {TOKEN}"} if TOKEN else {}
+    if body is None:
+        req = urllib.request.Request(API + path, headers=headers)
+    else:
+        headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(API + path, data=json.dumps(body).encode(),
+                                     headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=t) as r:
+            return json.load(r)
+    except Exception:
+        return None
+
+
+# ── the harness map ─────────────────────────────────────────────────────
+#
+# harness | signal | slot | priority
+#
+#   signal    "gpu:pattern,pattern", "process:pattern" or "port:number"
+#   slot      what the turnstile should serve while this harness works
+#   priority  highest wins when two harnesses are active together
+#
+# A game comes before everything: a stutter is visible, a background job
+# waiting twenty seconds is not.
+
+DEFAULT_MAP = """\
+# harness|signal|slot|priority
+game|gpu:.exe,steam|free-c0|100
+studio|gpu:comfy,diffusion,python3|free-all|80
+chat|port:10369|heretic9b-c1|50
+"""
+
+
+def read_map():
+    if not os.path.exists(MAP):
+        os.makedirs(os.path.dirname(MAP), exist_ok=True)
+        with open(MAP, "w") as f:
+            f.write(DEFAULT_MAP)
+    harnesses = []
+    with open(MAP) as f:
+        lines = f.read().splitlines()
+    for l in lines:
+        l = l.strip()
+        if not l or l.startswith("#"):
+            continue
+        p = l.split("|")
+        if len(p) < 4:
+            continue
+        harnesses.append({"name": p[0], "signal": p[1], "slot": p[2],
+                          "priority": int(p[3])})
+    return sorted(harnesses, key=lambda h: -h["priority"])
+
+
+def active(signal, processes, ports, on_gpu):
+    kind, value = signal.split(":", 1)
+    if kind == "gpu":
+        # The safest signal: a program that is REALLY holding a card. No
+        # command line to interpret, therefore no false positive.
+        return any(m.lower() in on_gpu for m in value.split(","))
+    if kind == "process":
+        return any(m.lower() in processes for m in value.split(","))
+    if kind == "port":
+        return value in ports
+    return False
+
+
+def look(harnesses, on_gpu):
+    """Which harness is working, right now? Highest priority wins."""
+    # Two traps, paid one after the other:
+    #
+    #   1. kernel threads carry their name in brackets — the pattern
+    #      "reaper" matched [oom_reaper] and a game appeared to be running
+    #      permanently. In acting mode it would have freed a card for a
+    #      kernel thread, in a loop. Propose-only mode is what caught it.
+    #
+    #   2. a command that merely MENTIONS the pattern triggers it: a
+    #      here-document containing a vendor name was enough. The pattern is
+    #      present in the searching process's own command line.
+    #
+    # Hence the "gpu:" signal, which reads no command line at all — only
+    # what is actually holding a card.
+    me = str(os.getpid())
+    processes = "\n".join(
+        l for l in sh("ps -eo pid=,args=").lower().splitlines()
+        if not l.split()[1:2] or not l.split(None, 1)[-1].strip().startswith("[")
+        if l.split()[0] != me and " grep " not in l and "turnstile-watch" not in l)
+    # A LISTENING port proves nothing: an ESTABLISHED connection is what
+    # says somebody is actually using it.
+    established = sh("ss -tn state established 2>/dev/null").splitlines()[1:]
+    ports = {p.rsplit(":", 1)[-1]
+             for l in established for p in l.split()[:4] if ":" in p}
+    return next((h for h in harnesses
+                 if active(h["signal"], processes, ports, on_gpu)), None)
+
+
+def record(line):
+    os.makedirs(os.path.dirname(JOURNAL), exist_ok=True)
+    with open(JOURNAL, "a") as f:
+        f.write(json.dumps(line, ensure_ascii=False) + "\n")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--act", action="store_true",
+                    help="really request slots; without it, only record")
+    ap.add_argument("--settle", type=int, default=SETTLE,
+                    help=f"seconds of continuous activity before moving "
+                         f"(default {SETTLE})")
+    a = ap.parse_args()
+
+    harnesses = read_map()
+    print(f"turnstile-watch: {len(harnesses)} harnesses · settle {a.settle} s "
+          f"· {'ACTING' if a.act else 'propose only'}", flush=True)
+    for h in harnesses:
+        print(f"  {h['name']:<10} {h['signal']:<42} -> {h['slot']}", flush=True)
+
+    candidate, since, last_asked = None, None, None
+    while True:
+        try:
+            # What holds a card comes from the service, which already knows
+            # how to ask NVIDIA, AMD or Intel. Asking the vendor tool here
+            # too would mean a second implementation to keep in step.
+            state = api("/state", t=15) or {}
+            on_gpu = "\n".join(u["program"].lower()
+                               for u in state.get("external_users", []))
+            h = look(harnesses, on_gpu)
+            name = h["name"] if h else None
+
+            if name != candidate:
+                candidate, since = name, time.time() if name else None
+            elif name and since and (time.time() - since) >= a.settle:
+                current = state.get("declared_slot")
+                # Nothing is touched during a load: a request arriving
+                # mid-swap is queued, it does not cancel anything.
+                if state.get("loading"):
+                    pass
+                elif current != h["slot"] and last_asked != h["slot"]:
+                    line = {"when": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                            "harness": name, "slot_wanted": h["slot"],
+                            "slot_current": current,
+                            "active_for_s": round(time.time() - since),
+                            "acted": a.act}
+                    if a.act:
+                        r = api("/slot", {"slot": h["slot"]}) or {}
+                        line["result"] = r.get("state")
+                        line["duration_s"] = r.get("duration_s")
+                    record(line)
+                    print(f"  {line['when']}  {name} active -> "
+                          f"{'asked for' if a.act else 'WOULD have asked for'} "
+                          f"{h['slot']}"
+                          f"{': ' + str(line.get('result')) if a.act else ''}",
+                          flush=True)
+                    last_asked = h["slot"]
+                    since = time.time()
+            if not name:
+                last_asked = None
+        except Exception as exc:
+            print(f"  watch: {exc}", file=sys.stderr, flush=True)
+        time.sleep(PERIOD)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

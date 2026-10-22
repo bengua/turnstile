@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# turnstile-record — archives the counters, one line per day.
+#
+# WHY THIS FILE EXISTS.
+#
+# Saying a system exists is worth nothing. Thirty days of counters answer
+# the only question that matters: did this thing actually serve me? The API
+# returns the instant only — without this record there is no series to look
+# at in a month, and that question stays unanswered forever.
+#
+# One JSON line per day, never overwritten. Readable with jq, plottable, and
+# submittable as-is to anyone asking whether it was worth building.
+set -euo pipefail
+
+API="${TURNSTILE_API:-http://127.0.0.1:8130}"
+ARCHIVE="${TURNSTILE_ARCHIVE:-$HOME/.local/state/turnstile/journal.jsonl}"
+TOKEN="${TURNSTILE_TOKEN:-}"
+AUTH=()
+[ -n "$TOKEN" ] && AUTH=(-H "Authorization: Bearer $TOKEN")
+
+mkdir -p "$(dirname "$ARCHIVE")"
+
+counters=$(curl -s --max-time 10 "${AUTH[@]}" "$API/counters" 2>/dev/null || echo '')
+if [ -z "$counters" ]; then
+  printf '{"when":"%s","error":"api unreachable"}\n' "$(date -Iseconds)" >> "$ARCHIVE"
+  exit 1
+fi
+
+state=$(curl -s --max-time 10 "${AUTH[@]}" "$API/state" 2>/dev/null || echo '{}')
+
+python3 - "$counters" "$state" "$ARCHIVE" <<'PY'
+import json, sys, datetime
+counters, state, archive = json.loads(sys.argv[1]), json.loads(sys.argv[2]), sys.argv[3]
+live = state.get("slots_live", {})
+line = {
+    "when": datetime.datetime.now().isoformat(timespec="seconds"),
+    # Whether the system serves at all.
+    "swaps_requested": counters.get("swaps_requested"),
+    "swaps_succeeded": counters.get("swaps_succeeded"),
+    "failures": counters.get("failures"),
+    "success_rate": counters.get("success_rate"),
+    # Whether the GRID is cut right: share of requests served with no swap.
+    # High means the slots match how the machine is actually used.
+    "requests_total": counters.get("requests_total"),
+    "reuse_rate": counters.get("reuse_rate"),
+    # What would betray an oscillation: a very short dwell.
+    "mean_dwell_s": counters.get("mean_dwell_s"),
+    # What the probe caught lying.
+    "divergences_seen": counters.get("divergences_seen"),
+    "wait_total_s": round(counters.get("wait_total_s") or 0, 1),
+    # What the estimator taught itself.
+    "learned_seconds_per_gb": counters.get("learned_seconds_per_gb"),
+    # The instant, for context.
+    "serving": [n for n, s in live.items() if s.get("status") == "serving"],
+    "diverging": [n for n, s in live.items() if s.get("status") == "diverging"],
+    "manual_containers": state.get("manual_containers", []),
+    "context_capped": [n for n, s in live.items() if s.get("context_capped")],
+    "memory_per_card_mib": state.get("memory_per_card_mib"),
+}
+with open(archive, "a") as f:
+    f.write(json.dumps(line, ensure_ascii=False) + "\n")
+print(f"recorded: {line['swaps_succeeded']}/{line['swaps_requested']} swaps · "
+      f"reuse {line['reuse_rate']} · {len(line['serving'])} slot(s) serving")
+PY

@@ -1,0 +1,6 @@
+[Unit]
+Description=Evaluate judge agreement and update the promotion registry
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/turnstile-cascade

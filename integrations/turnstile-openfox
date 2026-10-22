@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""turnstile-openfox — point OpenFox at the gateway, with the map's models.
+
+OpenFox discovers models from `/v1/models`, but a LiteLLM gateway announces
+the window as `max_input_tokens` while OpenFox reads `max_model_len` or
+`context_length`. Left alone, every model would be assumed to hold 200 000
+tokens, and a 32k slot would be overrun long before OpenFox compacts.
+
+So the provider's model list is generated from the map, like the gateway's.
+Per model OpenFox gets the slot name (which is the gateway name) and a window
+of 11/12 of the served context: the margin keeps compaction ahead of the
+server's hard limit (196 608 -> 180 224, the value this fleet had validated
+by hand).
+
+Local providers other than the gateway are removed, dead ports included: every client takes
+the same path, through the gateway. Fields OpenFox or the user set on a model
+(selection, thinking level) are kept when the model still exists.
+
+The file is written whole and renamed into place. OpenFox's own writer does
+not truncate, and a shorter config left the tail of an older one behind it,
+which made the file invalid JSON.
+
+Usage:
+    turnstile-openfox [--dry-run]
+"""
+import json
+import os
+import re
+import sys
+
+
+def _first_existing(*paths):
+    for p in paths:
+        p = os.path.expanduser(p)
+        if os.path.exists(p):
+            return p
+    return os.path.expanduser(paths[0])
+
+
+MAP = os.environ.get("TURNSTILE_MAP") or _first_existing(
+    "~/.config/turnstile/containers.map", "/etc/turnstile/containers.map")
+CONFIG = os.path.expanduser(
+    os.environ.get("OPENFOX_CONFIG", "~/.config/openfox/config.json"))
+GATEWAY = os.environ.get("TURNSTILE_GATEWAY_URL", "http://127.0.0.1:4000/v1")
+PROVIDER_ID = "turnstile"
+# Families that take a thinking switch through the chat template.
+THINKING = ("Q3.8-",)
+THINK_ON = '{"chat_template_kwargs":{"enable_thinking":true}}'
+THINK_OFF = '{"chat_template_kwargs":{"enable_thinking":false}}'
+
+
+def read_slots(path):
+    with open(path) as f:
+        lines = f.read().splitlines()
+    slots = []
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split("|")
+        if len(fields) < 5 or not fields[1].isdigit():
+            continue
+        c = re.search(r"(?:^|\s)-c\s+(\d+)", fields[4])
+        slots.append({"name": fields[0], "port": int(fields[1]),
+                      "context": int(c.group(1)) if c else None,
+                      "vision": "--mmproj" in fields[4]})
+    return slots
+
+
+def read_config(path):
+    """The first JSON object in the file; anything after it is debris."""
+    with open(path) as f:
+        text = f.read()
+    obj, end = json.JSONDecoder().raw_decode(text)
+    return obj, len(text.strip()) - end
+
+
+def model_entry(slot, previous):
+    m = dict(previous or {})
+    m.update({"id": slot["name"], "source": "user",
+              "supportsVision": slot["vision"]})
+    if slot["context"]:
+        m["contextWindow"] = slot["context"] * 11 // 12
+    if slot["name"].startswith(THINKING):
+        m.update({"thinkingEnabled": True, "nonThinkingEnabled": True,
+                  "thinkingQueryParams": THINK_ON, "nonThinkingQueryParams": THINK_OFF})
+    return m
+
+
+def is_direct(provider):
+    """A local provider other than the gateway: it bypasses the one path.
+    Remote providers (an API on the internet) are none of the map's business."""
+    m = re.match(r"https?://(127\.0\.0\.1|localhost):(\d+)", provider.get("url", ""))
+    return bool(m) and not provider.get("url", "").startswith(GATEWAY.rstrip("/"))
+
+
+def rebuild(config, slots):
+    config_providers = list(config.get("providers", []))
+    old = [p for p in config.get("providers", []) if p.get("id") == PROVIDER_ID]
+    previous = {m["id"]: m for p in old for m in p.get("models", [])}
+    removed = [p["id"] for p in config.get("providers", [])
+               if p.get("id") != PROVIDER_ID and is_direct(p)]
+    kept = [p for p in config.get("providers", [])
+            if p.get("id") != PROVIDER_ID and p["id"] not in removed]
+    provider = dict(old[0]) if old else {"createdAt": "", "isLocal": True,
+                                         "thinkingField": "reasoning_content",
+                                         "sendReasoningInMessages": True}
+    provider.update({"id": PROVIDER_ID, "name": "turnstile (via the gateway)",
+                     "url": GATEWAY, "backend": "openai",
+                     "models": [model_entry(s, previous.get(s["name"])) for s in slots]})
+    config["providers"] = [provider, *kept]
+    if config.get("activeProviderId") in removed or not config.get("activeProviderId"):
+        config["activeProviderId"] = PROVIDER_ID
+    # The model the user had selected keeps being selected: same port, now
+    # reached through the gateway under the slot's name.
+    sel = config.get("defaultModelSelection") or ""
+    if sel.split("/", 1)[0] in removed:
+        gone = next(p for p in config_providers if p["id"] == sel.split("/", 1)[0])
+        port = int(re.match(r"https?://[^:/]+:(\d+)", gone["url"]).group(1))
+        same = [s["name"] for s in slots if s["port"] == port]
+        config["defaultModelSelection"] = f"{PROVIDER_ID}/{(same or [slots[0]['name']])[0]}"
+    return config, removed
+
+
+def main():
+    dry = "--dry-run" in sys.argv
+    slots = read_slots(MAP)
+    if not slots:
+        sys.exit(f"no slot in {MAP}: refusing to empty the provider")
+    config, debris = read_config(CONFIG)
+    config, removed = rebuild(config, slots)
+    print(f"{len(slots)} models, providers removed: {removed or 'none'}, "
+          f"debris dropped: {debris} bytes", file=sys.stderr)
+    text = json.dumps(config, indent=2, ensure_ascii=False) + "\n"
+    if dry:
+        sys.stdout.write(text)
+        return
+    tmp = CONFIG + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, CONFIG)
+
+
+if __name__ == "__main__":
+    main()

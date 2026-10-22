@@ -1,0 +1,58 @@
+# `license` names the same license whose full text is in LICENSE; verify.sh
+# compares the two, because declaring one licence and shipping another grants
+# neither.
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "turnstile"
+version = "0.2.0"
+description = "A deterministic GPU allocator for local models: one slot at a time, and it never lies about which one."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Benoît Guarnaccia" }]
+dependencies = []
+
+[project.optional-dependencies]
+# ruff is PINNED so that CI and a local `./verify.sh` agree exactly. An
+# unpinned ruff drifts, and a run that passed yesterday fails today for a
+# reason that has nothing to do with the change.
+dev = ["ruff==0.16.6", "pytest>=8"]
+
+# The executables are plain stdlib scripts installed by install.sh, not a
+# Python package: the service must run on a bare machine with nothing but
+# python3, and `pip install` is one more thing that can be out of date on the
+# node while the repo says otherwise.
+[project.scripts]
+
+[tool.setuptools]
+packages = []
+
+[tool.ruff]
+line-length = 88
+
+# The executables carry no .py extension — they are commands, not modules —
+# so ruff would skip exactly the code that matters. Name them explicitly.
+extend-include = ["bin/turnstiled", "bin/turnstile-watch", "bin/turnstile-cascade",
+                  "bin/turnstile-names", "bin/turnstile-litellm",
+                  "integrations/turnstile-openfox"]
+
+[tool.ruff.lint]
+# Catching Exception is an architectural decision here, not carelessness, and
+# it is commented at every site. The probe loop must survive anything a vendor
+# tool or a container does: a probe that dies leaves the state frozen on its
+# last observation, which is precisely the silent lie this whole service
+# exists to remove. Same for the hardware detection, which tries four vendor
+# tools and must simply move on when one is absent or answers nonsense.
+ignore = ["BLE001", "S110", "S112"]
+
+[tool.ruff.lint.per-file-ignores]
+# The fault-injection scripts are deliberately written as scripts: they open
+# a file to read one line, catch everything so a scenario failing cannot stop
+# the run, and call subprocess without check= because a non-zero exit is
+# frequently the thing being measured. Holding them to library style would
+# make them longer and no safer.
+"fault-injection/*" = ["SIM115", "BLE001", "PLW1510", "EXE001", "UP031", "FURB122", "S"]

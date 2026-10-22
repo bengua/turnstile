@@ -1,0 +1,10 @@
+[Unit]
+Description=One counter snapshot per day, so there is a series in 30 days
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

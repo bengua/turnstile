@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""turnstile-names — a slot is named after what it carries, never the reverse.
+
+A container is a vase. When its name says what model it holds, the name lies
+the day the water changes: a slot called `assistant-9b` that now serves a 27B
+misleads every reader, and every judge that reads slot names as facts. So the
+name is not chosen, it is DERIVED, from three facts the container itself
+carries:
+
+    <model>-<engine>-<card>
+
+    model   the weights file passed with `-m`, without `.gguf`
+    engine  the image: `KVMem` for a KVMem build, `llamacpp` for the official
+            llama.cpp image, otherwise the image's own name
+    card    the GPU the container is given (`c0`, `c1`, …), `x2` when it sees
+            every card, `cpu` when it offloads nothing (`-ngl 0`)
+
+The model name therefore lives in exactly one place: the file name on disk.
+Rename the file and every derived name follows.
+
+Usage:
+    turnstile-names          print map name, derived name, verdict
+    turnstile-names check    same, exit 1 if any slot name is not its derived name
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+
+
+def _first_existing(*paths):
+    for p in paths:
+        p = os.path.expanduser(p)
+        if os.path.exists(p):
+            return p
+    return os.path.expanduser(paths[0])
+
+
+MAP = os.environ.get("TURNSTILE_MAP") or _first_existing(
+    "~/.config/turnstile/containers.map", "/etc/turnstile/containers.map")
+
+
+def read_slots(path):
+    """Slot names from the map, in order. Same grammar as turnstiled."""
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    slots = []
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split("|")
+        if len(fields) >= 5:
+            slots.append(fields)
+    return slots
+
+
+def engine(image):
+    if "kvmem" in image.lower():
+        return "KVMem"
+    if "ggml-org/llama.cpp" in image:
+        return "llamacpp"
+    return image.split(":")[0].split("/")[-1]
+
+
+def card(env, cmd, uuid_to_index):
+    """The card the container really gets, read from its own definition."""
+    if "-ngl" in cmd and cmd[cmd.index("-ngl") + 1] == "0":
+        return "cpu"
+    visible = env.get("CUDA_VISIBLE_DEVICES")
+    if not visible:
+        return "x2"
+    if visible in uuid_to_index:
+        return f"c{uuid_to_index[visible]}"
+    if visible.isdigit():
+        return f"c{visible}"
+    return "c?"
+
+
+def model(cmd):
+    if "-m" not in cmd:
+        return None
+    name = os.path.basename(cmd[cmd.index("-m") + 1]).removesuffix(".gguf")
+    # A model split in shards is passed by its first shard, `<model>-00001-of-00005.gguf`:
+    # the shard counter is not part of the model's name.
+    return re.sub(r"-\d{5}-of-\d{5}$", "", name)
+
+
+def derive(inspect, uuid_to_index):
+    """Derived name from one `docker inspect` object, or None if unreadable."""
+    cfg = inspect.get("Config") or {}
+    cmd = cfg.get("Cmd") or []
+    env = dict(e.split("=", 1) for e in cfg.get("Env") or [] if "=" in e)
+    m = model(cmd)
+    if not m:
+        return None
+    return f"{m}-{engine(cfg.get('Image', ''))}-{card(env, cmd, uuid_to_index)}"
+
+
+def gpu_indexes():
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    pairs = (line.split(",") for line in out.splitlines() if "," in line)
+    return {u.strip(): i.strip() for i, u in pairs}
+
+
+def inspect(name):
+    r = subprocess.run(["docker", "inspect", name], capture_output=True, text=True,
+                       check=False)
+    if r.returncode:
+        return None
+    return json.loads(r.stdout)[0]
+
+
+def main():
+    check = len(sys.argv) > 1 and sys.argv[1] == "check"
+    uuids = gpu_indexes()
+    wrong = 0
+    for fields in read_slots(MAP):
+        name = fields[0]
+        data = inspect(name)
+        derived = derive(data, uuids) if data else None
+        if data is None:
+            verdict = "NO CONTAINER"
+        elif derived == name:
+            verdict = "ok"
+        else:
+            verdict = f"LIES: carries {derived}"
+        if verdict != "ok":
+            wrong += 1
+        print(f"{name}  {verdict}")
+    if check and wrong:
+        print(f"{wrong} slot(s) not named after what they carry", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

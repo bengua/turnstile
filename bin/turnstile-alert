@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# turnstile-alert <unit> — pushes a notification when a systemd unit fails.
+#
+# This risk sits level with plain abandonment: if the service falls over,
+# nothing confronts the map with reality any more, and the machine goes back
+# to the silence it had before WITHOUT ANYONE NOTICING. The daily record
+# does see the outage — but nobody reads a journal they are not told about.
+#
+# Set TURNSTILE_NTFY to your own topic URL. Without it, this does nothing
+# and says so, rather than failing silently.
+set -u
+UNIT="${1:-unknown}"
+NTFY="${TURNSTILE_NTFY:-}"
+
+if [ -z "$NTFY" ]; then
+  echo "turnstile-alert: TURNSTILE_NTFY is not set, no alert sent for $UNIT" >&2
+  exit 0
+fi
+
+detail=$(systemctl --user status "$UNIT" --no-pager 2>/dev/null | tail -5 | tr "\n" " ")
+curl -s --max-time 8 -X POST "$NTFY" \
+  -H "Title: $UNIT is down" \
+  -H "Priority: 4" \
+  -H "Tags: warning" \
+  -d "Nothing is confronting the map with reality any more. $detail" \
+  >/dev/null 2>&1

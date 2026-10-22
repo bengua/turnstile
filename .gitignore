@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+uv.lock
+*.tmp
+
+# Your own machine's configuration never belongs here. The examples do, and
+# the order of these three lines matters: git applies the LAST rule that
+# matches, so the re-inclusions have to come after the exclusions.
+containers.map
+harness.map
+!examples/containers.map
+!examples/harness.map

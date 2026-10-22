@@ -1,0 +1,19 @@
+[Unit]
+Description=turnstile — GPU slot allocator: probes, swaps, and counts
+After=docker.service
+OnFailure=turnstile-alert@%n.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/turnstiled
+Restart=on-failure
+RestartSec=5
+# Uncomment to require a bearer token on the API, and to keep it off the LAN.
+# Environment=TURNSTILE_TOKEN=change-me
+# Environment=TURNSTILE_BIND=127.0.0.1
+# Containers to leave out of the "started by hand" list (a gateway, a proxy),
+# comma-separated; the name below is only an example:
+# Environment=TURNSTILE_IGNORE=litellm-proxy
+
+[Install]
+WantedBy=default.target

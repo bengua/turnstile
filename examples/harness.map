@@ -1,0 +1,17 @@
+# harness|signal|slot|priority
+#
+# signal    gpu:pattern      a program REALLY holding a card — the safest
+#           process:pattern  a command line (fragile: see below)
+#           port:number      an ESTABLISHED connection, not a mere listener
+# priority  highest wins; a game comes first, because a stutter is visible
+#           and a background job waiting twenty seconds is not
+#
+# WHY `gpu:` IS THE SAFE ONE. Matching command lines bites twice: kernel
+# threads carry their name in brackets, so `reaper` matches [oom_reaper] and
+# your game looks permanently active; and any command that merely MENTIONS
+# the pattern triggers it, including the watcher's own. A program holding
+# card memory is a fact, not a string.
+
+game|gpu:.exe,steam|free-c0|100
+studio|gpu:comfy,diffusion|free-all|80
+chat|port:10369|assistant-c1|50

@@ -1,0 +1,538 @@
+{
+  "id": "guardbeforerun01",
+  "name": "Guard before an agent run",
+  "nodes": [
+    {
+      "id": "n01",
+      "name": "Run request",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -720,
+        0
+      ],
+      "webhookId": "b2000000-0000-4000-8000-000000000002",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "guard-before-run",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "notes": "POST /webhook/guard-before-run — where a launcher knocks before dropping a job. THE RESPONSE NODE IS EXPLICIT: with `lastNode`, the answer was whichever branch finished last. With the shadow judge stopped, the guard answered allowed=null. A guard that says neither yes nor no guards nothing."
+    },
+    {
+      "id": "n02",
+      "name": "Real node state",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -500,
+        0
+      ],
+      "parameters": {
+        "url": "={{ $env.TURNSTILE_API || 'http://127.0.0.1:8130' }}/state",
+        "options": {
+          "timeout": 10000
+        },
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth"
+      },
+      "notes": "The probe READS the machine: container alive, port answering, memory consistent, model identity. No declared state is taken on trust. The token lives in an n8n credential of type Header Auth (Authorization / Bearer <token>), NOT in an environment variable: n8n blocks $env inside nodes by default, and unblocking it would hand every node the database password and the encryption key too. Unset the token on both sides and the API is open — fine on a loopback bind, careless on a LAN one.",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Turnstile token"
+        }
+      }
+    },
+    {
+      "id": "n03",
+      "name": "Build the state",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -280,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Build the judge's state from the REAL machine, never from a declaration.\n//\n// Rules applied here, every one of them paid for:\n//   - one narrow judgment per question, never \"which action should I take\"\n//   - the escalation case phrased as `true`\n//   - criteria are concrete situations, not adverbs\n//   - noul criteria use true/false, so they port to a local model unchanged\n//   - the model is PINNED: thresholds tuned against one version mean\n//     nothing on a model that changes underneath them\n//   - NOTHING THE QUESTION DOES NOT NEED. Measured on this machine, same\n//     instant, same questions: carrying a `context_capped` boolean on every\n//     slot dropped `node_unfit` from 0.94 to 0.87 — from a clear verdict to\n//     the grey zone, on a case that has an obvious answer. The field was\n//     true information and completely irrelevant to the question. Padding\n//     the state does not make a judgment safer, it makes it mushier.\n\nconst obs = $input.first().json;\nconst live = obs.slots_live || {};\n\n// A slot can carry an agent run if it is really serving AND holds a card.\n// A CPU model always answers — that is its job — but it cannot hold a\n// twenty-turn thread, so it does not count here.\n//\n// This is deliberately STRUCTURAL rather than a name match. An earlier\n// version tested the slot name against a regex of model sizes and quietly\n// reported zero capable slots on a machine where three were serving,\n// because the names did not happen to contain \"14b\" or \"27b\". A rule that\n// depends on how you named things breaks when you rename them.\nconst serving = Object.entries(live)\n  .filter(([, s]) => s.status === 'serving')\n  .map(([name, s]) => ({ name, card: s.card }));\n\nconst gpu = serving.filter((s) => s.card !== 'cpu').map((s) => s.name);\nconst cpu = serving.filter((s) => s.card === 'cpu').map((s) => s.name);\n\nconst state = {\n  gpu_slots_serving: gpu,\n  cpu_slots_serving: cpu,\n  swap_in_progress: Object.keys(obs.loading || {}),\n  manual_containers: obs.manual_containers || [],\n  house_rule:\n    'an agent run needs a model resident in card memory; a CPU model ' +\n    'always answers but cannot hold a twenty-turn thread',\n};\n\nconst questions = {\n  node_unfit: {\n    type: 'noul',\n    instructions:\n      'Is the node UNFIT to receive an agent run, meaning no slot is serving a model able to hold a twenty-turn thread?',\n    criteria: {\n      true: 'No suitable model is running on a graphics card: the list of capable slots is empty, or only CPU slots answer',\n      false: 'At least one slot serves a model resident in card memory, able to hold the thread',\n    },\n  },\n  work_to_preserve: {\n    type: 'noul',\n    instructions:\n      'Is work currently in progress on this node that a configuration swap would interrupt?',\n    criteria: {\n      true: 'A swap is already running, or a manually started container holds a card, or a game is running',\n      false: 'Nothing that a swap would disturb',\n    },\n  },\n};\n\nreturn [{ json: { state, model: 'jev-1.13.0', questions } }];\n"
+      }
+    },
+    {
+      "id": "n04",
+      "name": "Judge decides",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -60,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.JUDGE_URL || 'https://api.typesafe.ai/v1/systemone' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "timeout": 30000
+        },
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth"
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Two questions in ONE call: same latency as one, and the state is billed once. Measured: 1 question 0.24 s, 3 questions 0.25 s. RETRY: 3 attempts, 2 s apart — the API occasionally returns a 520 after 38 s or aborts the connection, and without a retry a network hiccup becomes a guard outage. The API key comes from an n8n credential of type Header Auth (Authorization / Bearer <key>), never from the workflow file.",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Judge API key"
+        }
+      }
+    },
+    {
+      "id": "n05",
+      "name": "Branch on thresholds",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        200,
+        -40
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.answers.work_to_preserve.noul }}",
+                    "rightValue": 0.5,
+                    "operator": {
+                      "type": "number",
+                      "operation": "gte"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "hold off"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.answers.node_unfit.noul }}",
+                    "rightValue": 0.9,
+                    "operator": {
+                      "type": "number",
+                      "operation": "gte"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "swap then allow"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.answers.node_unfit.noul }}",
+                    "rightValue": 0.2,
+                    "operator": {
+                      "type": "number",
+                      "operation": "lte"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "allow"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "grey zone: escalate"
+        }
+      },
+      "notes": "Thresholds 0.90 and 0.20, and BOTH are set by measured margin, not by taste. On this machine, same state, four passes: a node with a model on a card answers node_unfit 0.11-0.12 (variance 0.01); a node with nothing on a card answers 0.94-0.96. A threshold at 0.10 sat exactly on the first cluster and sent an obvious case to the grey zone. At 0.20 the margin is 0.08 — eight times the variance. THAT is where determinism comes from; not from the model, and never from a rounder-looking number."
+    },
+    {
+      "id": "n06",
+      "name": "Hold off",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        -220
+      ],
+      "parameters": {
+        "jsCode": "// The guard refuses, and says why. Never a technical error.\nconst a = $('Judge decides').first().json.answers;\nreturn [{ json: {\n  allowed: false,\n  reason: 'work in progress on the node',\n  retry_in_s: 300,\n  noul_work_to_preserve: a.work_to_preserve.noul,\n  noul_node_unfit: a.node_unfit.noul,\n}}];\n"
+      },
+      "notes": "A job killed mid-way loses its whole budget. It is never interrupted: the caller is told to come back."
+    },
+    {
+      "id": "n07",
+      "name": "Swap",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        460,
+        -60
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.TURNSTILE_API || 'http://127.0.0.1:8130' }}/slot",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ slot: $env.TURNSTILE_RUN_SLOT || 'coder-c1' }) }}",
+        "options": {
+          "timeout": 60000
+        },
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth"
+      },
+      "notes": "The turnstile answers already_serving, served with its duration, or queued with the estimated wait — never a technical error.",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Turnstile token"
+        }
+      }
+    },
+    {
+      "id": "n08",
+      "name": "Allow",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        100
+      ],
+      "parameters": {
+        "jsCode": "// The guard allows: the node already serves a capable model.\nconst a = $('Judge decides').first().json.answers;\nconst s = $('Build the state').first().json.state;\nreturn [{ json: {\n  allowed: true,\n  reason: 'the node already serves a capable model',\n  capable_slots: s.gpu_slots_serving,\n  noul_node_unfit: a.node_unfit.noul,\n  noul_work_to_preserve: a.work_to_preserve.noul,\n}}];\n"
+      },
+      "notes": "The guard says yes. The CALLER drops the job, not this workflow: a guard is not a launcher."
+    },
+    {
+      "id": "n09",
+      "name": "Grey zone: escalate",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        460,
+        260
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.NTFY_URL || 'https://ntfy.sh/change-me' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ title: 'Guard before run: grey zone', message: 'node_unfit=' + $('Judge decides').item.json.answers.node_unfit.noul + ' work=' + $('Judge decides').item.json.answers.work_to_preserve.noul + ' — the judge does not decide, a human should', priority: 4, tags: ['warning'] }) }}",
+        "options": {
+          "timeout": 8000
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Between 0.10 and 0.90 the judge is not clear enough. Nothing is decided in silence: a human is notified."
+    },
+    {
+      "id": "n10",
+      "name": "Allow after swap",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        -60
+      ],
+      "parameters": {
+        "jsCode": "// Only allow if the swap ACTUALLY completed.\n// A slot that was requested is not a slot that is serving.\nconst r = $input.first().json;\nconst ok = r.state === 'served' || r.state === 'already_serving';\nreturn [{ json: {\n  allowed: ok,\n  reason: 'swap: ' + r.state,\n  slot_requested: r.slot || null,\n  wait_s: r.duration_s ?? r.estimated_wait_s ?? 0,\n}}];\n"
+      },
+      "notes": "Allows only if the swap really completed. Queued or failed, the guard refuses."
+    },
+    {
+      "id": "n11",
+      "name": "Local judge in shadow",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        200,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.LOCAL_JUDGE_URL || 'http://127.0.0.1:8140/v1/systemone' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ state: $('Build the state').item.json.state, questions: $('Build the state').item.json.questions }) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "The local model answers in parallel, WITH NO EFFECT WHATSOEVER on the branching. Its only job is to accumulate pairs (state, remote verdict, local verdict) for a future specialisation: a base checkpoint here scored near chance and answered 1.00 to a question AND to its opposite. onError continue: a shadow failure must never break the guard."
+    },
+    {
+      "id": "n12",
+      "name": "Pair up",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        420
+      ],
+      "parameters": {
+        "jsCode": "// Archive the pair, for a future local specialisation.\n// One line per decision, never overwritten: this is the training corpus.\nconst remote = $('Judge decides').first().json.answers;\nlet local = null;\ntry { local = $('Local judge in shadow').first().json.answers; } catch (e) { local = null; }\n\nconst flat = (o) => Object.fromEntries(\n  Object.entries(o).map(([k, v]) => [k, v.noul ?? v.choice]));\n\nreturn [{ json: {\n  when: new Date().toISOString(),\n  question_set: 'guard-before-run',\n  state: $('Build the state').first().json.state,\n  remote: flat(remote),\n  local: local ? flat(local) : null,\n  // Agreement is computed later by the evaluator; here we only record.\n  agreement: local ? Object.keys(remote).every(\n    (k) => local[k] !== undefined &&\n      ((remote[k].noul ?? 0) > 0.5) === ((local[k].noul ?? 0) > 0.5)) : null,\n}}];\n"
+      },
+      "notes": "The specialisation corpus is built here, one decision at a time."
+    },
+    {
+      "id": "n13",
+      "name": "Store the pair",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        700,
+        420
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.TURNSTILE_API || 'http://127.0.0.1:8130' }}/pair",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "timeout": 8000
+        },
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth"
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Appends one line to the corpus on the node. `turnstile-cascade` reads it daily to compute agreement. onError continue: losing a pair must never break the guard.",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Turnstile token"
+        }
+      }
+    },
+    {
+      "id": "n14",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        960,
+        0
+      ],
+      "parameters": {
+        "options": {}
+      },
+      "notes": "The only node that answers. The four decision branches converge here; the shadow branch never touches it."
+    },
+    {
+      "id": "n15",
+      "name": "Grey zone verdict",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        260
+      ],
+      "parameters": {
+        "jsCode": "// Escalation is not a decision. The guard refuses, says why, and names the\n// fact that a human has been asked.\nconst a = $('Judge decides').first().json.answers;\nreturn [{ json: {\n  allowed: false,\n  reason: 'grey zone: the judge does not decide, a human has been notified',\n  retry_in_s: 600,\n  noul_node_unfit: a.node_unfit.noul,\n  noul_work_to_preserve: a.work_to_preserve.noul,\n}}];\n"
+      },
+      "notes": "A notification receipt is not a verdict. This node turns the escalation into an explicit refusal, so the four decision branches all answer in the same shape."
+    }
+  ],
+  "connections": {
+    "Run request": {
+      "main": [
+        [
+          {
+            "node": "Real node state",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Real node state": {
+      "main": [
+        [
+          {
+            "node": "Build the state",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build the state": {
+      "main": [
+        [
+          {
+            "node": "Judge decides",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Judge decides": {
+      "main": [
+        [
+          {
+            "node": "Branch on thresholds",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Local judge in shadow",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Branch on thresholds": {
+      "main": [
+        [
+          {
+            "node": "Hold off",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Swap",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Allow",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Grey zone: escalate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Swap": {
+      "main": [
+        [
+          {
+            "node": "Allow after swap",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Local judge in shadow": {
+      "main": [
+        [
+          {
+            "node": "Pair up",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pair up": {
+      "main": [
+        [
+          {
+            "node": "Store the pair",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hold off": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Allow": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Allow after swap": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Grey zone: escalate": {
+      "main": [
+        [
+          {
+            "node": "Grey zone verdict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Grey zone verdict": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "pinData": {},
+  "tags": []
+}

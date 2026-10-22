@@ -1,0 +1,8 @@
+[Unit]
+Description=Failure notification for %i
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/turnstile-alert %i
+# Set your own ntfy topic, or the alert is skipped with a message.
+# Environment=TURNSTILE_NTFY=https://ntfy.sh/your-topic

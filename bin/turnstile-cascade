@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""turnstile-cascade — promotes questions from a remote judge to a local one.
+
+WHAT IT DOES.
+
+Reads the corpus of pairs (state, remote verdict, local verdict) accumulated
+by the workflow, computes agreement PER QUESTION, and updates the registry
+that says which model serves which question.
+
+The point is not to replace the remote judge. It is to stop paying for the
+questions a local model has already proven it answers the same way — one
+question at a time, with a way back.
+
+THE PARAMETERS, AND WHERE THEY COME FROM.
+
+  promotion per question, not in bulk         settled
+  minimum cases before specialising           500 (weak confidence)
+  agreement required to promote               97 % (weak confidence)
+  sampled control after promotion             5-15 % (the firmest of all)
+  automatic demotion                          settled
+
+The two weak-confidence parameters are the ones to refine by measurement
+once a real corpus exists. A judge asked to set them with no data hesitated,
+and was right to.
+
+WHAT IT DOES NOT DO.
+
+It promotes nothing while agreement is poor, and that is the expected
+behaviour today: a base checkpoint answers 1.00 to a question AND to its
+opposite. The guard rail works on its own.
+"""
+import json
+import os
+import sys
+from collections import defaultdict
+
+CORPUS = os.path.expanduser(
+    os.environ.get("TURNSTILE_CORPUS", "~/.local/state/turnstile/pairs.jsonl"))
+REGISTRY = os.path.expanduser("~/.local/state/turnstile/who-serves-what.json")
+JOURNAL = os.path.expanduser("~/.local/state/turnstile/cascade.jsonl")
+
+# Only lines carrying a KNOWN question set count.
+#
+# A fault-injection benchmark once appended 20 000 fictitious pairs at 100 %
+# agreement, and this evaluator PROMOTED an invented question to production.
+# Nothing distinguished test data from a real decision. A corpus that accepts
+# anything promotes anything.
+#
+# Add your own question sets here, or set TURNSTILE_QUESTION_SETS to a
+# comma-separated list.
+KNOWN_SETS = set(filter(None, os.environ.get(
+    "TURNSTILE_QUESTION_SETS", "guard-before-run").split(",")))
+
+MIN_CASES = 500            # below this, do not even try
+PROMOTE_AT = 0.97          # agreement needed to hand a question over
+DEMOTE_BELOW = 0.93        # below this, back to the remote judge — a 4-point
+                           # dead band stops a question oscillating every pass
+CONTROL = 0.10             # share still sent to the remote judge after promotion
+WINDOW = 2000              # judge on recent cases only
+
+
+def load_corpus():
+    lines = []
+    try:
+        with open(CORPUS) as f:
+            for l in f:
+                l = l.strip()
+                if not l:
+                    continue
+                try:
+                    lines.append(json.loads(l))
+                except ValueError:
+                    continue
+    except OSError:
+        return []
+    return lines[-WINDOW:]
+
+
+def load_registry():
+    try:
+        with open(REGISTRY) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"questions": {}, "version": 1}
+
+
+def save(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def agreement_per_question(corpus):
+    """For each question, how often the local model lands on the same side.
+
+    The comparison is on the DECISION, not the probability: the decision is
+    what makes software act, and it is the stable part. Measured here, the
+    label moved by 0.01 across repeated calls while the confidence moved by
+    0.17 — comparing confidences would report disagreement that changes no
+    outcome."""
+    stats = defaultdict(lambda: {"seen": 0, "agreed": 0})
+    ignored = 0
+    for line in corpus:
+        if line.get("question_set") not in KNOWN_SETS:
+            ignored += 1
+            continue
+        remote, local = line.get("remote") or {}, line.get("local") or {}
+        if not local:
+            continue
+        for q, vr in remote.items():
+            vl = local.get(q)
+            if vl is None:
+                continue
+            s = stats[q]
+            s["seen"] += 1
+            if isinstance(vr, (int, float)) and isinstance(vl, (int, float)):
+                s["agreed"] += (vr > 0.5) == (vl > 0.5)
+            else:
+                s["agreed"] += vr == vl
+    if ignored:
+        print(f"  {ignored} line(s) ignored: unknown question set\n")
+    return {q: {**s, "agreement": (s["agreed"] / s["seen"]) if s["seen"] else None}
+            for q, s in stats.items()}
+
+
+def main():
+    corpus = load_corpus()
+    registry = load_registry()
+    stats = agreement_per_question(corpus)
+
+    if not corpus:
+        print(f"  empty corpus ({CORPUS})")
+        print("  nothing to evaluate: no pair has been archived yet")
+        return 0
+
+    print(f"  {len(corpus)} pairs in the window · minimum required {MIN_CASES}\n")
+    print(f"  {'question':<24}{'seen':>7}{'agree':>9}   serves   decision")
+    print("  " + "-" * 64)
+
+    changes = []
+    for q, s in sorted(stats.items()):
+        serves = registry["questions"].get(q, {}).get("serves", "remote")
+        a = s["agreement"]
+        if s["seen"] < MIN_CASES:
+            decision = f"wait ({MIN_CASES - s['seen']} more)"
+        elif serves == "remote" and a >= PROMOTE_AT:
+            registry["questions"][q] = {"serves": "local", "agreement": round(a, 4),
+                                        "seen": s["seen"], "control": CONTROL}
+            decision = "PROMOTED to local"
+            changes.append((q, "promotion", a))
+        elif serves == "local" and a < DEMOTE_BELOW:
+            registry["questions"][q] = {"serves": "remote", "agreement": round(a, 4),
+                                        "seen": s["seen"], "control": 1.0}
+            decision = "DEMOTED to remote"
+            changes.append((q, "demotion", a))
+        else:
+            registry["questions"].setdefault(q, {"serves": serves, "control": 1.0})
+            registry["questions"][q].update(
+                {"agreement": round(a, 4) if a else None, "seen": s["seen"]})
+            if serves == "remote":
+                decision = f"not promoted ({PROMOTE_AT - (a or 0):+.1%} from threshold)"
+            else:
+                decision = "kept"
+        print(f"  {q:<24}{s['seen']:>7}"
+              f"{(f'{a:.1%}' if a is not None else '—'):>9}   {serves:<8} {decision}")
+
+    save(REGISTRY, registry)
+    if changes:
+        import datetime
+        os.makedirs(os.path.dirname(JOURNAL), exist_ok=True)
+        with open(JOURNAL, "a") as f:
+            for q, what, a in changes:
+                f.write(json.dumps({
+                    "when": datetime.datetime.now(
+                        datetime.timezone.utc).astimezone().isoformat(
+                            timespec="seconds"),
+                    "question": q, "event": what,
+                    "agreement": round(a, 4)}, ensure_ascii=False) + "\n")
+        print(f"\n  {len(changes)} change(s) recorded in {JOURNAL}")
+    else:
+        print(f"\n  no change · registry: {REGISTRY}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

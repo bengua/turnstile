@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# turnstile — the command line face of the allocator.
+#
+# WHAT THIS FILE IS NOT.
+#
+# It holds no decision logic. It used to: an earlier version read the map,
+# decided which containers to stop and start, waited on memory, verified.
+# All of that now lives in `turnstiled`, a service that PROBES continuously
+# and COUNTS what it does.
+#
+# The reason is not elegance. KEEPING TWO DECIDERS WOULD HAVE CANCELLED THE
+# WHOLE POINT. A manual fallback path beside the service means two systems
+# deciding and none of them authoritative — exactly the problem being
+# solved. So this file decides nothing: it calls, and it prints.
+set -uo pipefail
+
+API="${TURNSTILE_API:-http://127.0.0.1:8130}"
+TOKEN="${TURNSTILE_TOKEN:-}"
+AUTH=()
+[ -n "$TOKEN" ] && AUTH=(-H "Authorization: Bearer $TOKEN")
+
+_json() { python3 -c "import json,sys;d=json.load(sys.stdin);$1" 2>/dev/null; }
+
+_down() {
+  echo "turnstiled unreachable on $API" >&2
+  echo "  systemctl --user status turnstiled" >&2
+  exit 1
+}
+
+case "${1:-status}" in
+
+  status|state)
+    state=$(curl -s --max-time 8 "${AUTH[@]}" "$API/state") || _down
+    [ -n "$state" ] || _down
+    printf '%s' "$state" | _json '
+live = d.get("slots_live", {})
+print("declared slot:", d.get("declared_slot") or "none")
+M = {"serving": chr(9679), "loading": chr(9680), "diverging": "x"}
+for n, s in sorted(live.items()):
+    cap = "  CONTEXT CAPPED" if s.get("context_capped") else ""
+    print("  %s %-18s %-10s card %-5s ctx %s%s" % (
+        M.get(s["status"], "o"), n, s["status"], s["card"],
+        s.get("context_granted"), cap))
+for n in d.get("manual_containers", []):
+    print("  ~ %-18s started by hand, respected" % n)
+for n, b in (d.get("loading") or {}).items():
+    print("  %s %-18s loading, ~%s s left" % (chr(9680), n,
+                                              b["estimated_remaining_s"]))
+for u in d.get("external_users", []):
+    print("  ! %-18s %s MiB, outside the turnstile" % (u["program"], u["mib"]))
+for i, m in enumerate(d.get("memory_per_card_mib", [])):
+    print("  card %d: %s MiB" % (i, m))' || _down
+    ;;
+
+  slots)
+    curl -s --max-time 8 "${AUTH[@]}" "$API/slots" | _json '
+for n, s in sorted(d.get("slots", {}).items()):
+    print("  %-18s port %-6s card %-5s ctx %s" % (n, s["port"], s["card"],
+                                                  s["context_requested"]))
+for n, s in sorted(d.get("release_slots", {}).items()):
+    print("  %-18s %s" % (n, s["purpose"]))' || _down
+    ;;
+
+  counters)
+    curl -s --max-time 8 "${AUTH[@]}" "$API/counters" | _json '
+print("  swaps      %s/%s  failures %s" % (d["swaps_succeeded"],
+                                           d["swaps_requested"], d["failures"]))
+print("  reuse      %s   (%s/%s with no swap)" % (d["reuse_rate"],
+      d["requests_already_serving"], d["requests_total"]))
+print("  divergences %s" % d["divergences_seen"])
+print("  waiting    %.1f s total" % d["wait_total_s"])
+for k, v in (d.get("learned_seconds_per_gb") or {}).items():
+    src = "seed" if v["still_using_seed"] else "measured"
+    print("  %-16s %.3f s/GB  (%s points, %s)" % (k, v["median"], v["points"], src))' \
+      || _down
+    ;;
+
+  -h|--help|help)
+    cat <<END
+turnstile — front end for turnstiled
+
+  turnstile status     the REAL state: four facts against the declared slot
+  turnstile slots      what can be loaded, read from containers.map
+  turnstile counters   swaps, reuse, divergences, learned load times
+  turnstile <slot>     load a slot; answers already_serving, served or queued
+  turnstile restore    go back to whatever was serving before the current slot
+
+A game takes a card with \`turnstile free-c0\` and hands it back with
+\`turnstile restore\`. The service remembers; nothing else has to.
+
+The API lives on $API. Automation calls it directly.
+END
+    ;;
+
+  *)
+    slot="$1"
+    # 300 s: the daemon gives a big model up to 2 s per GB (Flash-Next, 108 GB) before calling
+    # its load failed; a shorter wait made `restore` after a game exit 1 while it succeeded.
+    r=$(curl -s --max-time 300 -X POST "${AUTH[@]}" "$API/slot" \
+        -H 'Content-Type: application/json' -d "{\"slot\":\"$slot\"}") || _down
+    [ -n "$r" ] || _down
+    printf '%s' "$r" | _json '
+e = d.get("state")
+if e == "unknown":
+    print("unknown slot: %s  (turnstile slots)" % d.get("slot"))
+elif e == "queued":
+    print("queued behind %s — about %s s" % (d["ahead"], d["estimated_wait_s"]))
+elif e == "already_serving":
+    print("already serving")
+elif e == "served":
+    print("served in %s s" % d["duration_s"])
+elif e == "rate_limited":
+    print("refused: %s swaps in the last hour (ceiling %s). %s" % (
+        d["swaps_last_hour"], d["ceiling"], d["reason"]))
+elif e == "nothing_to_restore":
+    print("nothing to restore: %s" % d.get("reason"))
+elif e == "still_busy":
+    print("%s MiB still held after stopping %s — external users: %s" % (
+        d["memory_remaining_mib"], d.get("stopped"),
+        [u["program"] for u in d.get("external_users", [])]))
+else:
+    print(e, d)'
+    ;;
+esac
